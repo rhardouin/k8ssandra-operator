@@ -77,6 +77,8 @@ Alter the following keyspaces in the same way:
 - `data_endpoint_auth` (Stargate)
 - `reaper_db` (Reaper)
 
+Before altering `system_auth`, `system_distributed`, or `system_traces`, follow [Preserve legacy system-keyspace replication]({{< relref "/tasks/migrate/preserve-legacy-system-keyspace-replication" >}}). A discovery-aware migration keeps their current replication maps until the new datacenter can safely receive replicas.
+
 
 ## Restrict traffic to dc1
 
@@ -177,7 +179,7 @@ Datacenter: dc1
 ===============
 Status=Up/Down
 |/ State=Normal/Leaving/Joining/Moving
---  Address     Load      Tokens  Owns (effective)  Host ID                               Rack   
+--  Address     Load      Tokens  Owns (effective)  Host ID                               Rack
 UN  10.xx.xx.57  7.58 MiB  16      100.0%            9299e226-d2fa-4c2e-9fba-3b344d5d47b7  default
 UN  10.xx.xx.7   7.54 MiB  16      100.0%            51c2fb0e-7fad-4b6e-8e4d-2108dc204cd5  default
 UN  10.xx.xx.4   7.89 MiB  16      100.0%            6a92531f-a086-4c40-9067-50899b8974a0  default
@@ -186,7 +188,7 @@ Datacenter: dc2
 ===============
 Status=Up/Down
 |/ State=Normal/Leaving/Joining/Moving
---  Address     Load      Tokens  Owns (effective)  Host ID                               Rack   
+--  Address     Load      Tokens  Owns (effective)  Host ID                               Rack
 UN  10.xx.xx.36  6.97 MiB  16      100.0%            eba0964a-835f-4c76-978e-f25eda0b49ad  default
 UN  10.xx.xx.20  6.81 MiB  16      100.0%            d15f93f4-248d-478f-8832-b87b4e3981d2  default
 UN  10.xx.xx.80  6.71 MiB  16      100.0%            db09fd06-e011-11ec-9d64-0242ac120002  default
@@ -261,7 +263,7 @@ Datacenter: dc2
 ===============
 Status=Up/Down
 |/ State=Normal/Leaving/Joining/Moving
---  Address     Load      Tokens  Owns (effective)  Host ID                               Rack   
+--  Address     Load      Tokens  Owns (effective)  Host ID                               Rack
 UN  10.xx.xx.36  6.97 MiB  16      100.0%            eba0964a-835f-4c76-978e-f25eda0b49ad  default
 UN  10.xx.xx.20  6.81 MiB  16      100.0%            d15f93f4-248d-478f-8832-b87b4e3981d2  default
 UN  10.xx.xx.80  6.71 MiB  16      100.0%            6bca9cdf-03f8-4658-84b9-28c5395235ba  default
@@ -273,4 +275,4 @@ Connect to Reaper’s UI in `dc2`, and re-register the cluster, specifying only 
 ## Next steps
 
 * Explore other K8ssandra Operator [tasks]({{< relref "/tasks" >}}).
-* See the [Reference]({{< relref "/reference" >}}) topics for information about K8ssandra Operator Custom Resource Definitions (CRDs) and the single K8ssandra Operator Helm chart. 
+* See the [Reference]({{< relref "/reference" >}}) topics for information about K8ssandra Operator Custom Resource Definitions (CRDs) and the single K8ssandra Operator Helm chart.

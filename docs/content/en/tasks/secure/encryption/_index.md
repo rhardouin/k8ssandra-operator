@@ -269,6 +269,93 @@ spec:
 
 The `clientEncryptionStores` also feature `KeystorePasswordRef`, which is ignored in this case. When both `certificatesSecretRef` and `clientEncryptionStores` are set, the operator will use `certificatesSecretRef` and log a line about doing so.
 
+## Secure legacy-source discovery
+
+Migration discovery uses dedicated source CQL fields. They are separate from `serverEncryptionStores` and `clientEncryptionStores`, which configure Java keystore/truststore material for managed Cassandra workloads.
+
+### Source credentials
+
+If the legacy source requires CQL authentication, create an `Opaque` Secret in the same namespace as the `K8ssandraCluster`. It must contain non-empty `username` and `password` keys.
+
+```yaml
+apiVersion: v1
+kind: Secret
+metadata:
+  name: legacy-cql-reader
+  namespace: k8ssandra-operator
+type: Opaque
+stringData:
+  username: <legacy-read-only-username>
+  password: <legacy-password-from-your-secret-manager>
+```
+
+Reference it only through the dedicated field:
+
+```yaml
+spec:
+  secretsProvider: internal
+  cassandra:
+    legacyCqlCredentialsSecretRef:
+      name: legacy-cql-reader
+```
+
+Do not commit literal production credentials. Do not reuse `superuserSecretRef` or another target superuser credential: source authentication and target authentication are independent.
+
+Configure the source authorizer so this identity can issue only the discovery `SELECT` queries against `system.local`, `system.peers_v2`, and `system_schema.keyspaces`. The exact grant syntax depends on the source authorizer; discovery does not need schema-write permission.
+
+The driver authenticates before it can read and verify the source cluster identity. Valid credentials therefore do not prove that an IP belongs to the intended cluster; keep `spec.cassandra.clusterName` accurate and restrict network access to the expected source endpoints.
+
+If these credentials cross any network that is not explicitly trusted, authenticated TLS is required. Password authentication without TLS exposes the source credential to interception. Omitting `legacyCqlTLSSecretRef` is supported only when every hop from the discovery Pod to every `additionalSeeds` endpoint is on a trusted network covered by your organization's security policy.
+
+### Source TLS
+
+When source CQL uses TLS, create a second same-namespace Secret with PEM data:
+
+- `ca.crt` is required.
+- `tls.crt` and `tls.key` are optional for one-way TLS, but must be provided together for mutual TLS.
+
+```bash
+kubectl create secret generic legacy-cql-tls \
+  --from-file=ca.crt=./<source-ca.pem> \
+  --from-file=tls.crt=./<optional-client-cert.pem> \
+  --from-file=tls.key=./<optional-client-key.pem> \
+  -n k8ssandra-operator
+```
+
+For one-way TLS, omit both client flags. Reference the Secret with:
+
+```yaml
+spec:
+  cassandra:
+    legacyCqlTLSSecretRef:
+      name: legacy-cql-tls
+```
+
+Discovery verifies the certificate against the exact contacted IP and rejects configurations that disable certificate verification. Ensure the certificate contains that IP in its subject alternative names. A DNS-only certificate does not validate an IP-literal `additionalSeeds` entry.
+
+### Kubernetes least privilege
+
+The per-attempt worker ServiceAccount can access only its pre-created result ConfigMap in the discovery namespace, with `get` and `patch`. It cannot create ConfigMaps, read Secrets through the Kubernetes API, or list namespace resources. The attempt input, HMAC key, copied credential/TLS material, and result target are mounted or named explicitly.
+
+For the discovery lifecycle, the controller's data-plane identity needs these namespaced permissions:
+
+- core `configmaps`: `create`, `delete`, `get`, `list`, `patch`, `watch`
+- core `secrets`: `create`, `delete`, `get`, `list`, `watch`
+- core `serviceaccounts`: `create`, `delete`, `get`, `list`, `watch`
+- core `pods`: `delete`, `get`, `list`, `watch`
+- batch `jobs`: `create`, `delete`, `get`, `list`, `watch`
+- rbac.authorization.k8s.io `roles` and `rolebindings`: `create`, `delete`, `get`, `list`, `watch`
+
+On the control plane, the controller needs `get`, `list`, and `watch` on the referenced core `secrets`, plus its existing `K8ssandraCluster` and status permissions. These are the discovery-specific permissions; the complete operator Role also contains permissions for the operator's other controllers. Do not grant the worker the controller Role.
+
+### Secret binding and rotation
+
+At attempt creation, the controller binds each reference by purpose, source Kubernetes context, namespace, name, relevant keys, and Secret `resourceVersion`. It re-reads that fully qualified source before use. Only the required keys are copied into a controller-owned Secret in the selected discovery data-plane namespace and mounted read-only into the bounded Job. Secret bytes are never stored in `K8ssandraCluster` status, Events, or the accepted snapshot.
+
+Changing either referenced Secret invalidates stale work and requeues the cluster. The controller authoritatively re-reads both Secrets and their `resourceVersion` values immediately before the acceptance compare-and-swap; a rotation at that boundary prevents acceptance. Recoverable credential and TLS failures retry automatically with bounded backoff. After snapshot acceptance, the attempt Job, Pods, copied Secret, HMAC Secret, result and input ConfigMaps, ServiceAccount, Role, and RoleBinding are deleted asynchronously; managed-datacenter authorization remains in the accepted status, which retains binding metadata but no Secret data.
+
+`secretsProvider: external` is not supported for a discovery-aware migration. Synchronize the required source Secrets into the `K8ssandraCluster` namespace using your approved secret-delivery process, then reference the Kubernetes Secret by name.
+
 ## Next steps
 
 Explore other K8ssandra [tasks]({{< relref "/tasks" >}}).

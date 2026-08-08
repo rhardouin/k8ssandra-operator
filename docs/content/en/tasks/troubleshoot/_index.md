@@ -38,6 +38,86 @@ Events:
   Warning  Error   2m    k8ssandra-operator 1.0  reconcile failed: failed to create CassandraDatacenter: admission webhook "cassandra.datastax.com" denied the request: CassandraDatacenter.cassandra.datastax.com "demo-dc1" is invalid: spec.serverType: Unsupported value: "bogus": supported values: "dse", "cassandra"
 ```
 
+## Troubleshoot legacy replication discovery
+
+New `K8ssandraCluster` migrations with non-empty `spec.cassandra.additionalSeeds` are gated before managed Cassandra creation. Check their discovery state with:
+
+```bash
+kubectl get k8c <cluster_name> -n <namespace> \
+  -o jsonpath='{.status.legacyRFDiscovery.phase}{"\t"}{.status.legacyRFDiscovery.reason}{"\t"}{.status.legacyRFDiscovery.message}{"\n"}'
+kubectl get events -n <namespace> \
+  --field-selector involvedObject.kind=K8ssandraCluster,involvedObject.name=<cluster_name> \
+  --sort-by=.lastTimestamp
+```
+
+`Pending` means that a bounded discovery attempt is in progress. `Blocked` reports one of the finite reasons below. `Accepted` means the immutable snapshot passed readback; it does not mean the managed datacenter is Ready. Identical phase/reason/message states do not update `lastTransitionTime` or emit duplicate Events, so use current status as the primary signal rather than expecting periodic Events.
+
+`ExternalReplicationDrift` is different: discovery remains `Accepted`, while the separate `SystemKeyspaceReplicationReady` condition becomes `False`.
+
+```bash
+kubectl get k8c <cluster_name> -n <namespace> \
+  -o jsonpath='{range .status.conditions[?(@.type=="SystemKeyspaceReplicationReady")]}{.status}{"\t"}{.reason}{"\t"}{.message}{"\n"}{end}'
+```
+
+If CREATE fails during an operator upgrade, confirm that the packaged Deployment is using `Recreate` and that the old manager Pod has terminated before the new webhook admits discovery-marked objects. Do not bypass a failing webhook or manually run old and new reconcilers together; mixed-version operation is unsupported.
+
+### Stable reasons and recovery
+
+The Retry column matches the controller's public failure contract. “Automatic” means the controller retries with bounded backoff after the prerequisite recovers; some permanent failures require a corrected new migration object.
+
+| Reason | Surface | Retry | Safe corrective action |
+|---|---|---:|---|
+| `AdmissionUnavailable` | CREATE admission response; no object status | Automatic client retry | Restore the mutating webhook service, endpoints, certificate, and API-server reachability, then submit CREATE again. Do not bypass the webhook. |
+| `MarkerInvalid` | `Blocked` | No | Do not add or edit `k8ssandra.io/legacy-rf-discovery-version`. Recreate through supported admission. |
+| `UnsupportedServerType` | `Blocked` or CREATE rejection | No | Use this workflow only with `serverType: cassandra`; DSE and HCD are unsupported. |
+| `UnsupportedSourceVersion` | `Blocked` | No | Upgrade the legacy source to Apache Cassandra 4.0 or newer before migrating. |
+| `UnsupportedSecretsProvider` | `Blocked` or CREATE rejection | No | Set `spec.secretsProvider: internal`; external providers are unsupported for discovery. |
+| `DiscoveryTooLate` | `Blocked` | No | Managed Cassandra state already exists. Stop and use a reviewed rollback/recreation procedure; discovery cannot be started retroactively. |
+| `InvalidContactPoint` | `Blocked` or CREATE rejection | No | Use IP literals only, without ports, zones, or surrounding whitespace. |
+| `JobSchedulingFailed` | `Blocked` | Automatic | Inspect data-plane scheduling Events, quota, admission policy, node selectors, and service-account availability. |
+| `WorkerImageUnavailable` | `Blocked` | Automatic | Restore the configured digest-pinned discovery worker image reference. |
+| `WorkerImagePullFailed` | `Blocked` | Automatic | Restore registry reachability and image-pull authorization in the discovery data plane. |
+| `DiscoveryDeadlineExceeded` | `Blocked` | Automatic | Restore network/source responsiveness; the Job has a bounded deadline and no Job-level retry. |
+| `CredentialSecretInvalid` | `Blocked` | Automatic | In the `K8ssandraCluster` namespace, restore the referenced Secret with non-empty `username` and `password` keys. |
+| `TLSMaterialInvalid` | `Blocked` | Automatic | Restore PEM `ca.crt`; if using mutual TLS, provide both `tls.crt` and `tls.key`. |
+| `AuthenticationRejected` | `Blocked` | Automatic | Correct the dedicated source credential and confirm the source authenticator accepts it. |
+| `AuthorizationDenied` | `Blocked` | No | Grant the discovery identity the required `SELECT` permissions on `system.local`, `system.peers_v2`, and `system_schema.keyspaces`. |
+| `TLSFailed` | `Blocked` | Automatic | Correct the CA/client material and make the certificate valid for the contacted IP. Verification cannot be disabled. |
+| `ContactUnreachable` | `Blocked` | Automatic | Restore data-plane connectivity to at least one ordered source IP on TCP 9042. |
+| `IdentityMismatch` | `Blocked` | No | Point seeds at the intended cluster and make `spec.cassandra.clusterName` (or `metadata.name`) match its Cassandra cluster name. |
+| `SchemaDisagreement` | `Blocked` | Automatic | Wait for source schema agreement and stop concurrent schema changes, then let discovery retry. |
+| `TopologyInconsistent` | `Blocked` | Automatic | Repair incomplete or conflicting source topology metadata and wait for it to stabilize. |
+| `ManagedDatacenterNameCollision` | `Blocked` | No | Rename the planned managed datacenter so its Cassandra datacenter name does not collide with an observed external name. |
+| `MissingKeyspace` | `Blocked` | No | Restore all of `system_auth`, `system_traces`, and `system_distributed`; discovery never creates them. |
+| `UnsupportedStrategy` | `Blocked` | No | Convert each required system keyspace to `NetworkTopologyStrategy` before retrying. |
+| `InvalidReplication` | `Blocked` | No | Correct malformed RF metadata. Present RF values must be ASCII base-10 integers in `1..2147483647`; sparse maps are allowed. |
+| `StaleDiscoveryResult` | `Blocked` | Automatic | Allow the stale attempt to be discarded and retried against the current generation, seeds, Secret versions, and plan. |
+| `InvalidDiscoveryResult` | `Blocked` | Automatic | Inspect worker/controller health and allow the invalid result to be discarded. Do not retrieve or edit `result.json`. |
+| `ForgedDiscoveryResult` | `Blocked` | Automatic | Remove unauthorized writers from the attempt namespace, restore controller-managed resources, and allow a clean attempt. |
+| `DiscoveryResultTooLarge` | `Blocked` | Automatic | Check for abnormal source topology/result growth; results above the controller limit are rejected. Do not collect the result body. |
+| `KubernetesAPIUnavailable` | `Blocked` | Automatic | Restore control-plane/data-plane API access and referenced `ClientConfig` connectivity. |
+| `KubernetesAPIConflict` | `Blocked` | Automatic | Allow reconciliation to retry after concurrent object/status updates settle. |
+| `SnapshotConflict` | `Blocked` | No | If any managed DC exists or existed, stop: rediscovery is forbidden for this object. Before managed creation, the controller may rediscover only after authoritative absence checks succeed. |
+| `ManagedStatePresent` | `Blocked` | No | Managed Cassandra state already exists in a current or historical location. Do not delete evidence to force rediscovery. |
+| `ExternalReplicationDrift` | `Accepted` plus `SystemKeyspaceReplicationReady=False` | Automatic after correction | Compare all three live external maps with `acceptedSnapshot.replication`, correct the externally owned drift deliberately, and let the operator re-read. It issues zero DDL while drift exists. |
+
+Inspect attempt infrastructure without exposing its Secret data or result body:
+
+```bash
+kubectl get jobs,pods -n <data-plane-namespace> \
+  -l k8ssandra.io/cluster-name=<cluster_name>,k8ssandra.io/cluster-namespace=<namespace>
+kubectl describe job -n <data-plane-namespace> <discovery-job>
+kubectl logs -n <data-plane-namespace> job/<discovery-job>
+kubectl get k8c <cluster_name> -n <namespace> \
+  -o jsonpath='{.status.legacyRFDiscovery.acceptedSnapshot.attemptTrace}'
+```
+
+Logs, status, Events, and the accepted attempt trace are sanitized. Do not print credential/TLS Secrets, the HMAC Secret, attempt inputs, or result ConfigMap bodies. Attempt Jobs, Pods, copied inputs, and results are normally cleaned up after acceptance, so their absence after `Accepted` is expected.
+
+### Snapshot recovery boundary
+
+Before any managed `CassandraDatacenter` exists, missing or corrupt accepted state can trigger a full rediscovery only after authoritative absence checks cover both current and historical managed locations. Once `managedCreationObserved` is true, or any current/historical absence check is ambiguous or finds state, snapshot loss is a permanent conflict for that object. Deleting a DC or removing it from the current specification does not reset this history.
+
 ## Inspecting the cluster status
 
 The cluster status can be obtained with the following command (executed in the appropriate namespace):

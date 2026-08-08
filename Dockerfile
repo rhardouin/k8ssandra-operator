@@ -39,6 +39,7 @@ WORKDIR /
 COPY --from=builder /workspace/manager /manager
 COPY --from=builder /workspace/legacy-rf-discovery /legacy-rf-discovery
 COPY ./LICENSE /licenses/LICENSE
+COPY ./licenses/Apache-Cassandra-GoCQL-Driver-NOTICE /licenses/Apache-Cassandra-GoCQL-Driver-NOTICE
 
 USER 65532:65532
 
