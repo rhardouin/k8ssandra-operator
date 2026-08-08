@@ -351,6 +351,12 @@ func TestWorkerInvalidCandidateBoundaryFallsBackWithoutMerging(t *testing.T) {
 			candidate.Before.Topology[1].Address = candidate.Before.Topology[0].Address
 			candidate.After.Topology[1].Address = candidate.After.Topology[0].Address
 		}, reason: api.LegacyRFReasonTopologyInconsistent},
+		{name: "duplicate host ID in one datacenter", mutate: func(candidate *Candidate) {
+			candidate.Before.Topology[1].Datacenter = candidate.Before.Topology[0].Datacenter
+			candidate.After.Topology[1].Datacenter = candidate.After.Topology[0].Datacenter
+			candidate.Before.Topology[1].HostID = candidate.Before.Topology[0].HostID
+			candidate.After.Topology[1].HostID = candidate.After.Topology[0].HostID
+		}, reason: api.LegacyRFReasonTopologyInconsistent},
 		{name: "managed name collision", mutate: func(candidate *Candidate) {
 			candidate.Before.Topology[0].Datacenter, candidate.After.Topology[0].Datacenter = "managed", "managed"
 		}, reason: api.LegacyRFReasonManagedDatacenterNameCollision},

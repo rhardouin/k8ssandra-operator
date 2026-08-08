@@ -175,6 +175,30 @@ func TestLegacyRFAcceptedSeedsIgnoreLaterSpecEdits(t *testing.T) {
 	require.Equal(t, "192.0.2.10", cluster.Status.LegacyRFDiscovery.AcceptedSnapshot.AcceptedSeeds[0])
 }
 
+func TestLegacyRFAcceptedSnapshotKeepsGoverningAfterSeedRemoval(t *testing.T) {
+	snapshot := &api.LegacyRFSnapshot{AcceptedSeeds: []string{"192.0.2.10", "2001:db8::10"}}
+	hash, err := LegacyRFSnapshotHash(snapshot)
+	require.NoError(t, err)
+	snapshot.Hash = hash
+	cluster := &api.K8ssandraCluster{
+		ObjectMeta: metav1.ObjectMeta{Annotations: map[string]string{api.LegacyRFDiscoveryMarkerAnnotation: api.LegacyRFDiscoveryMarkerVersion}},
+		Spec:       api.K8ssandraClusterSpec{Cassandra: &api.CassandraClusterTemplate{}},
+		Status: api.K8ssandraClusterStatus{LegacyRFDiscovery: &api.LegacyRFDiscoveryStatus{
+			Phase: api.LegacyRFDiscoveryPhaseAccepted, SnapshotHash: snapshot.Hash, AcceptedSnapshot: snapshot,
+		}},
+	}
+
+	require.False(t, legacyRFDiscoveryQualifies(cluster), "removing seeds ends qualification for new discovery")
+	require.True(t, legacyRFDiscoveryGoverns(cluster),
+		"an accepted snapshot must keep owning bootstrap seeds, creation, and schema reconciliation")
+
+	seeds, err := acceptedLegacyRFSeeds(cluster, nil)
+
+	require.NoError(t, err)
+	require.Equal(t, []string{"192.0.2.10", "2001:db8::10"}, seeds,
+		"bootstrap must consume the accepted seed set, not the emptied spec")
+}
+
 func TestLegacyRFMarkerAloneDoesNotReplaceOrdinaryAdditionalSeeds(t *testing.T) {
 	cluster := &api.K8ssandraCluster{
 		ObjectMeta: metav1.ObjectMeta{Annotations: map[string]string{

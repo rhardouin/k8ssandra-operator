@@ -119,7 +119,7 @@ func (r *K8ssandraClusterReconciler) checkInitialSystemReplication(
 	ctx context.Context,
 	kc *api.K8ssandraCluster,
 	logger logr.Logger) (cassandra.SystemReplication, error) {
-	if legacyRFDiscoveryQualifies(kc) {
+	if legacyRFDiscoveryGoverns(kc) {
 		return nil, nil
 	}
 	replication := make(map[string]int)
@@ -179,7 +179,7 @@ func (r *K8ssandraClusterReconciler) updateReplicationOfSystemKeyspaces(
 	if recResult := r.versionCheck(ctx, kc); recResult.Completed() {
 		return recResult
 	}
-	if legacyRFDiscoveryQualifies(kc) {
+	if legacyRFDiscoveryGoverns(kc) {
 		return r.reconcileAcceptedLegacyRFSchema(kc, mgmtApi, logger)
 	}
 

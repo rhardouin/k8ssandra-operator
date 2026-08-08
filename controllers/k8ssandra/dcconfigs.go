@@ -60,7 +60,7 @@ func (r *K8ssandraClusterReconciler) createDatacenterConfigs(
 		// We only set this for the first DC. For subsequent DCs, the replication will be altered and a rebuild
 		// triggered.
 		if kc.Spec.Cassandra.ServerType.IsCassandra() && len(dcConfigs) == 0 &&
-			!legacyRFDiscoveryQualifies(kc) {
+			!legacyRFDiscoveryGoverns(kc) {
 			cassandra.ApplySystemReplication(dcConfig, systemReplication)
 		}
 

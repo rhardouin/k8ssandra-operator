@@ -221,9 +221,10 @@ func validateTopology(hosts []TopologyHost, managed []ManagedLocation) ([]string
 			return nil, NewBoundaryError(api.LegacyRFReasonTopologyInconsistent,
 				errors.New("one source address has conflicting topology identities"))
 		}
-		if prior, found := hostIDs[host.HostID]; found && prior.Datacenter != host.Datacenter {
+		if prior, found := hostIDs[host.HostID]; found &&
+			(prior.Datacenter != host.Datacenter || prior.Address.Unmap() != address) {
 			return nil, NewBoundaryError(api.LegacyRFReasonTopologyInconsistent,
-				errors.New("one source host ID has conflicting datacenters"))
+				errors.New("one source host ID maps to conflicting addresses or datacenters"))
 		}
 		if _, collision := managedNames[host.Datacenter]; collision {
 			return nil, NewBoundaryError(api.LegacyRFReasonManagedDatacenterNameCollision,

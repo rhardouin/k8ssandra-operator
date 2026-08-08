@@ -355,7 +355,7 @@ func applyLegacyRFUserCreationGate(cluster *api.K8ssandraCluster, datacenter *ca
 }
 
 func acceptedLegacyRFSeeds(cluster *api.K8ssandraCluster, unmarked []string) ([]string, error) {
-	if !legacyRFDiscoveryQualifies(cluster) {
+	if !legacyRFDiscoveryGoverns(cluster) {
 		return append([]string(nil), unmarked...), nil
 	}
 	status := cluster.Status.LegacyRFDiscovery
@@ -366,7 +366,7 @@ func acceptedLegacyRFSeeds(cluster *api.K8ssandraCluster, unmarked []string) ([]
 }
 
 func (r *K8ssandraClusterReconciler) createManagedDatacenter(ctx context.Context, cluster *api.K8ssandraCluster, config *cassandra.DatacenterConfig, desired *cassdcapi.CassandraDatacenter, remoteClient client.Client) error {
-	if !legacyRFDiscoveryQualifies(cluster) {
+	if !legacyRFDiscoveryGoverns(cluster) {
 		return remoteClient.Create(ctx, desired)
 	}
 	if r.LegacyRFDiscovery == nil {

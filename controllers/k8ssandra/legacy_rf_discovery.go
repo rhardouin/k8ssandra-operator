@@ -93,6 +93,23 @@ func legacyRFDiscoveryQualifies(cluster *api.K8ssandraCluster) bool {
 	return found && marker != ""
 }
 
+// legacyRFDiscoveryGoverns reports whether the discovery contract owns this cluster's bootstrap
+// seeds, managed-datacenter creation, and system-keyspace reconciliation. Qualification only
+// decides whether discovery still has to run; once a snapshot is accepted the contract keeps
+// governing for the lifetime of the object, so changing or removing additionalSeeds afterwards
+// must not hand the three system keyspaces back to the create-or-alter path. Callers still
+// validate snapshot integrity themselves, which keeps a corrupt snapshot failing closed.
+func legacyRFDiscoveryGoverns(cluster *api.K8ssandraCluster) bool {
+	if cluster == nil {
+		return false
+	}
+	if status := cluster.Status.LegacyRFDiscovery; status != nil &&
+		status.Phase == api.LegacyRFDiscoveryPhaseAccepted {
+		return true
+	}
+	return legacyRFDiscoveryQualifies(cluster)
+}
+
 func legacyRFPrerequisiteDecision(
 	cluster *api.K8ssandraCluster,
 ) *LegacyRFDiscoveryDecision {
