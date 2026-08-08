@@ -9,6 +9,8 @@ github.com/Masterminds/semver/v3 v3.4.0 h1:Zog+i5UMtVoCU8oKka5P7i9q9HgrJeGzI9SA1
 github.com/Masterminds/semver/v3 v3.4.0/go.mod h1:4V+yj/TJE1HU9XfppCwVMZq3I84lprf4nC11bSS5beM=
 github.com/adutra/goalesce v0.0.0-20240403131323-132a3887da57 h1:5kZrj4R1IvFECevBiGFZC+gFpAD03imigfLoAgjrgzs=
 github.com/adutra/goalesce v0.0.0-20240403131323-132a3887da57/go.mod h1:h79N/MZbZaH7agZ8yNoA+4rRU30iLqYxr52B5CQVKCw=
+github.com/apache/cassandra-gocql-driver/v2 v2.1.2 h1:lu/p0Db2av18enHJvWJQoChLssI0P+AR06STq4VdvCc=
+github.com/apache/cassandra-gocql-driver/v2 v2.1.2/go.mod h1:QH/asJjB3mHvY6Dot6ZKMMpTcOrWJ8i9GhsvG1g0PK4=
 github.com/apache/tinkerpop/gremlin-go v0.0.0-20220530191148-29272fa563ec h1:9cMmVpOQmePSOC13vDamxE79yyRFbmBv7eLaoBayGZs=
 github.com/apache/tinkerpop/gremlin-go v0.0.0-20220530191148-29272fa563ec/go.mod h1:+83SLBh+WdhcTo/eUHRuU0PZKH60Mg3wR5yX2UKyhyo=
 github.com/beorn7/perks v1.0.1 h1:VlbKKnNfV8bJzeqoa4cOKqO6bYr3WgKZxO8Z16+hsOM=

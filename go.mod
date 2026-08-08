@@ -6,6 +6,7 @@ require (
 	github.com/Jeffail/gabs v1.4.0
 	github.com/Masterminds/semver/v3 v3.4.0
 	github.com/adutra/goalesce v0.0.0-20240403131323-132a3887da57
+	github.com/apache/cassandra-gocql-driver/v2 v2.1.2
 	github.com/apache/tinkerpop/gremlin-go v0.0.0-20220530191148-29272fa563ec
 	github.com/bombsimon/logrusr/v2 v2.0.1
 	github.com/cert-manager/cert-manager v1.18.5
