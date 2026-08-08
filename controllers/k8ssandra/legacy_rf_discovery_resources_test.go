@@ -82,14 +82,14 @@ func TestBuildLegacyRFAttemptResourcesIsBoundedAndLeastPrivilege(t *testing.T) {
 	}
 }
 
-func TestBuildLegacyRFAttemptResourcesRejectsMutableImageAndInvalidKey(t *testing.T) {
+func TestBuildLegacyRFAttemptResourcesRejectsUnresolvableImageAndInvalidKey(t *testing.T) {
 	attempt := resourceTestAttempt(t)
 	tests := []struct {
 		name   string
 		mutate func(*discovery.Attempt, *[]byte)
 	}{
-		{name: "mutable image", mutate: func(attempt *discovery.Attempt, _ *[]byte) {
-			attempt.WorkerImageDigest = "registry.example/operator:latest"
+		{name: "malformed digest image", mutate: func(attempt *discovery.Attempt, _ *[]byte) {
+			attempt.WorkerImageDigest = "registry.example/operator@sha256:abc"
 		}},
 		{name: "short HMAC key", mutate: func(_ *discovery.Attempt, key *[]byte) { *key = []byte("short") }},
 	}

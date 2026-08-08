@@ -85,8 +85,8 @@ func validateAttemptResourceInput(input LegacyRFAttemptResourcesInput) error {
 	if len(input.HMACKey) != legacyRFHMACKeyBytes {
 		return fmt.Errorf("build legacy RF attempt resources: HMAC key must be %d bytes", legacyRFHMACKeyBytes)
 	}
-	if !immutableImageReference(input.Attempt.WorkerImageDigest) {
-		return errors.New("build legacy RF attempt resources: worker image must be digest pinned")
+	if !resolvableImageReference(input.Attempt.WorkerImageDigest) {
+		return errors.New("build legacy RF attempt resources: worker image must be a resolvable reference")
 	}
 	if len(input.Attempt.OrderedSeeds) == 0 || input.Attempt.SeedDigest == "" {
 		return errors.New("build legacy RF attempt resources: ordered seed binding is required")
@@ -97,9 +97,18 @@ func validateAttemptResourceInput(input LegacyRFAttemptResourcesInput) error {
 	return nil
 }
 
-func immutableImageReference(image string) bool {
+// resolvableImageReference accepts the references the manager image resolver can produce: a
+// digest-pinned reference, or the manager's own configured reference when the runtime reports
+// no pullable digest. A digest, when present, must still be a well-formed SHA-256 reference.
+func resolvableImageReference(image string) bool {
+	if image == "" || strings.ContainsAny(image, " \t\r\n") {
+		return false
+	}
 	repository, digest, found := strings.Cut(image, "@")
-	return found && repository != "" && validSHA256Digest(digest) && !strings.ContainsAny(image, " \t\r\n")
+	if !found {
+		return true
+	}
+	return repository != "" && validSHA256Digest(digest)
 }
 
 type attemptMetadata struct {

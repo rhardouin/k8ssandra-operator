@@ -84,16 +84,31 @@ func normalizeManagerImageID(imageID, configuredImage string) (string, error) {
 	identity := stripRuntimeScheme(imageID)
 	repository, digest, found := strings.Cut(identity, "@")
 	if !found {
-		if configuredRepository, configuredDigest, configured := strings.Cut(configuredImage, "@"); configured &&
-			configuredRepository != "" && validSHA256Digest(configuredDigest) {
-			return configuredRepository + "@" + configuredDigest, nil
-		}
-		return "", errors.New("resolve running manager image: digest-only identity requires an immutable configured image")
+		return managerImageFromDigestOnlyIdentity(identity, configuredImage)
 	}
 	if repository == "" || !validSHA256Digest(digest) || strings.ContainsAny(identity, " \t\r\n") {
 		return "", errors.New("resolve running manager image: image identity is not an immutable SHA-256 reference")
 	}
 	return repository + "@" + digest, nil
+}
+
+// managerImageFromDigestOnlyIdentity handles runtimes that report the running image as a bare
+// digest with no repository. containerd does this for images loaded into its store rather than
+// pulled, and that digest names the image config, so it is not usable as a pull reference. The
+// worker then runs the manager's own configured reference, which is by construction the image
+// the manager itself is running.
+func managerImageFromDigestOnlyIdentity(identity, configuredImage string) (string, error) {
+	if !validSHA256Digest(identity) {
+		return "", errors.New("resolve running manager image: image identity is not an immutable SHA-256 reference")
+	}
+	if configuredRepository, configuredDigest, configured := strings.Cut(configuredImage, "@"); configured &&
+		configuredRepository != "" && validSHA256Digest(configuredDigest) {
+		return configuredRepository + "@" + configuredDigest, nil
+	}
+	if configuredImage == "" || strings.ContainsAny(configuredImage, " \t\r\n") {
+		return "", errors.New("resolve running manager image: digest-only identity requires a configured image reference")
+	}
+	return configuredImage, nil
 }
 
 func stripRuntimeScheme(identity string) string {

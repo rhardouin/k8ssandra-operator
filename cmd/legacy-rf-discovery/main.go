@@ -93,8 +93,8 @@ func execute(ctx context.Context, arguments []string, dependencies executableDep
 	if err != nil {
 		return err
 	}
-	if !isImmutableImageDigest(attempt.WorkerImageDigest) {
-		return errors.New("worker image digest binding is invalid")
+	if !isResolvableImageReference(attempt.WorkerImageDigest) {
+		return errors.New("worker image binding is invalid")
 	}
 	observerOptions, err := readObserverOptions(attempt.Connection.SecretBindings, options)
 	if err != nil {
@@ -137,15 +137,23 @@ func discoverAndPublish(
 	return nil
 }
 
-func isImmutableImageDigest(value string) bool {
-	digest := value
-	if separator := strings.LastIndexByte(value, '@'); separator >= 0 {
-		if separator == 0 {
-			return false
-		}
-		digest = value[separator+1:]
+// isResolvableImageReference mirrors the controller-side binding rule: the worker runs whichever
+// reference the manager image resolver produced. That is a digest-pinned reference when the
+// runtime exposes one, and otherwise the manager's own configured reference. A digest, when
+// present, must still be a well-formed SHA-256 digest.
+func isResolvableImageReference(value string) bool {
+	if value == "" || strings.ContainsAny(value, " \t\r\n") {
+		return false
 	}
-	if !strings.HasPrefix(digest, "sha256:") || strings.ContainsAny(value, " \t\r\n") {
+	separator := strings.LastIndexByte(value, '@')
+	if separator < 0 {
+		return true
+	}
+	if separator == 0 {
+		return false
+	}
+	digest := value[separator+1:]
+	if !strings.HasPrefix(digest, "sha256:") {
 		return false
 	}
 	encoded := strings.TrimPrefix(digest, "sha256:")

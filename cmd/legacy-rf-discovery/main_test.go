@@ -124,8 +124,8 @@ func TestRunFailsClosedWithStableRedactedErrors(t *testing.T) {
 		mutate func(*discovery.Attempt, *runPaths, *fakeObserver, *fakeResultPublisher)
 		cancel bool
 	}{
-		{name: "mutable worker image", mutate: func(attempt *discovery.Attempt, _ *runPaths, _ *fakeObserver, _ *fakeResultPublisher) {
-			attempt.WorkerImageDigest = "registry.example/operator:mutable"
+		{name: "malformed worker image digest", mutate: func(attempt *discovery.Attempt, _ *runPaths, _ *fakeObserver, _ *fakeResultPublisher) {
+			attempt.WorkerImageDigest = "registry.example/operator@sha256:abc"
 		}},
 		{name: "missing qualified auth mount", mutate: func(attempt *discovery.Attempt, paths *runPaths, _ *fakeObserver, _ *fakeResultPublisher) {
 			attempt.Connection.SecretBindings = []discovery.SecretBinding{{Purpose: "auth", SourceContext: "source", Namespace: "ns", Name: "auth", Keys: []string{"username", "password"}, ResourceVersion: "1"}}
