@@ -101,6 +101,9 @@ jobs:
           - RemoveLocalDcFrom4.0Cluster
           - RemoveLocalDcFrom4.1Cluster
           - RemoveLocalDcFrom5.0Cluster
+          - LegacyRFDiscoveryFrom4.0Cluster
+          - LegacyRFDiscoveryFrom4.1Cluster
+          - LegacyRFDiscoveryFrom5.0Cluster
           - AddDcToClusterSameDataplane
           - CreateMedusaConfiguration
       fail-fast: false

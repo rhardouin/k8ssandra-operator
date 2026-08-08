@@ -122,6 +122,10 @@ func generateK8ssandraOperatorKustomization(config OperatorDeploymentConfig) err
 		config.ControlPlaneComponent = "github.com/k8ssandra/k8ssandra-operator/config/deployments/control-plane?ref=" + config.ImageTag
 		config.DataPlaneComponent = "github.com/k8ssandra/k8ssandra-operator/config/deployments/data-plane?ref=" + config.ImageTag
 	}
+	templateConfig := operatorKustomizationConfig{
+		OperatorDeploymentConfig: config,
+		ImageTransform:           renderOperatorImageTransform(config),
+	}
 	controlPlaneTmpl := `
 apiVersion: kustomize.config.k8s.io/v1beta1
 kind: Kustomization
@@ -132,9 +136,7 @@ resources:
 - {{ .ControlPlaneComponent }}
 
 images:
-  - name: k8ssandra/k8ssandra-operator
-    newName: {{ .ImageName }}
-    newTag: {{ .ImageTag }}
+{{ .ImageTransform }}
 
 patches:
 - target:
@@ -224,9 +226,7 @@ resources:
 - {{ .DataPlaneComponent }}
 
 images:
-  - name: k8ssandra/k8ssandra-operator
-    newName: {{ .ImageName }}
-    newTag: {{ .ImageTag }}
+{{ .ImageTransform }}
 
 patches:
 - target:
@@ -306,12 +306,25 @@ replacements:
       - webhooks.0.clientConfig.service.namespace
 `
 
-	err := generateKustomizationFile(fmt.Sprintf("k8ssandra-operator/%s", controlPlaneDir), config, controlPlaneTmpl)
+	err := generateKustomizationFile(fmt.Sprintf("k8ssandra-operator/%s", controlPlaneDir), templateConfig, controlPlaneTmpl)
 	if err != nil {
 		return err
 	}
 
-	return generateKustomizationFile(fmt.Sprintf("k8ssandra-operator/%s", dataPlaneDir), config, dataPlaneTmpl)
+	return generateKustomizationFile(fmt.Sprintf("k8ssandra-operator/%s", dataPlaneDir), templateConfig, dataPlaneTmpl)
+}
+
+type operatorKustomizationConfig struct {
+	OperatorDeploymentConfig
+	ImageTransform string
+}
+
+func renderOperatorImageTransform(config OperatorDeploymentConfig) string {
+	transform := fmt.Sprintf("  - name: k8ssandra/k8ssandra-operator\n    newName: %s", config.ImageName)
+	if config.ImageDigest != "" {
+		return transform + "\n    digest: " + config.ImageDigest
+	}
+	return transform + "\n    newTag: " + config.ImageTag
 }
 
 // generateKustomizationFile Creates the directory <project-root>/build/test-config/<name>
@@ -515,6 +528,7 @@ type OperatorDeploymentConfig struct {
 	ClusterScoped         bool
 	ImageName             string
 	ImageTag              string
+	ImageDigest           string
 	MedusaImageTag        string
 	GithubKustomization   bool // If true, use the kustomization.yaml from the github repo
 	ControlPlaneComponent string

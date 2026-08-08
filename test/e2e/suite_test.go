@@ -152,6 +152,11 @@ var (
 		"latest",
 		"The k8ssandra-operator image tag to use.",
 	)
+	imageDigest = flag.String(
+		"imageDigest",
+		"",
+		"Optional immutable digest for the k8ssandra-operator image.",
+	)
 	medusaImageTag = flag.String(
 		"medusaImageTag",
 		"",
@@ -247,6 +252,18 @@ func TestOperator(t *testing.T) {
 	t.Run("RemoveLocalDcFrom5.0Cluster", e2eTest(ctx, &e2eTestOpts{
 		testFunc: removeLocalDcFromCluster,
 		fixture:  framework.NewTestFixture("remove-local-dc-5.0", controlPlane),
+	}))
+	t.Run("LegacyRFDiscoveryFrom4.0Cluster", e2eTest(ctx, &e2eTestOpts{
+		testFunc:                     legacyRFCassandra40,
+		doCassandraDatacenterCleanup: true,
+	}))
+	t.Run("LegacyRFDiscoveryFrom4.1Cluster", e2eTest(ctx, &e2eTestOpts{
+		testFunc:                     legacyRFCassandra41,
+		doCassandraDatacenterCleanup: true,
+	}))
+	t.Run("LegacyRFDiscoveryFrom5.0Cluster", e2eTest(ctx, &e2eTestOpts{
+		testFunc:                     legacyRFCassandra50,
+		doCassandraDatacenterCleanup: true,
 	}))
 	t.Run("CreateSingleReaperNoStargate", e2eTest(ctx, &e2eTestOpts{
 		testFunc: createSingleReaper,
@@ -512,6 +529,7 @@ func beforeTest(t *testing.T, f *framework.E2eFramework, opts *e2eTestOpts) erro
 		ClusterScoped:       opts.clusterScoped,
 		ImageName:           *imageName,
 		ImageTag:            *imageTag,
+		ImageDigest:         *imageDigest,
 		MedusaImageTag:      *medusaImageTag,
 		GithubKustomization: false,
 	}
@@ -587,6 +605,7 @@ func upgradeToLatest(t *testing.T, ctx context.Context, f *framework.E2eFramewor
 		ClusterScoped: false,
 		ImageName:     *imageName,
 		ImageTag:      *imageTag,
+		ImageDigest:   *imageDigest,
 	}
 
 	if err := f.DeployK8ssandraOperator(deploymentConfig); err != nil {
