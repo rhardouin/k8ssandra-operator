@@ -38,6 +38,17 @@ rules:
   resources:
     - pods
   verbs:
+    - delete
+    - get
+    - list
+    - watch
+- apiGroups:
+    - ""
+  resources:
+    - serviceaccounts
+  verbs:
+    - create
+    - delete
     - get
     - list
     - watch
@@ -64,6 +75,16 @@ rules:
     - get
     - list
     - update
+    - watch
+- apiGroups:
+    - batch
+  resources:
+    - jobs
+  verbs:
+    - create
+    - delete
+    - get
+    - list
     - watch
 - apiGroups:
     - cassandra.datastax.com
@@ -135,6 +156,14 @@ rules:
     - patch
     - update
     - watch
+- apiGroups:
+    - events.k8s.io
+  resources:
+    - events
+  verbs:
+    - create
+    - patch
+    - update
 - apiGroups:
     - k8ssandra.io
   resources:
@@ -224,6 +253,17 @@ rules:
     - list
     - patch
     - update
+    - watch
+- apiGroups:
+    - rbac.authorization.k8s.io
+  resources:
+    - rolebindings
+    - roles
+  verbs:
+    - create
+    - delete
+    - get
+    - list
     - watch
 - apiGroups:
     - reaper.k8ssandra.io

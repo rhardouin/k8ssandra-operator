@@ -24084,6 +24084,40 @@ spec:
                         description: The image tag to use. Defaults to "latest".
                         type: string
                     type: object
+                  legacyCqlCredentialsSecretRef:
+                    description: |-
+                      LegacyCqlCredentialsSecretRef references credentials used only to discover a legacy
+                      Cassandra cluster. The Secret must be in the K8ssandraCluster namespace.
+                    properties:
+                      name:
+                        default: ""
+                        description: |-
+                          Name of the referent.
+                          This field is effectively required, but due to backwards compatibility is
+                          allowed to be empty. Instances of this type with an empty value here are
+                          almost certainly wrong.
+                          More info: https://kubernetes.io/docs/concepts/overview/working-with-objects/names/#names
+                        type: string
+                    type: object
+                    x-kubernetes-map-type: atomic
+                  legacyCqlTLSSecretRef:
+                    description: |-
+                      LegacyCqlTLSSecretRef references source TLS material used only to discover a legacy
+                      Cassandra cluster. The Secret must be in the K8ssandraCluster namespace and contain
+                      PEM-encoded ca.crt data; optional PEM-encoded tls.crt and tls.key entries must be
+                      provided together. Secret content validation occurs during controller reconciliation.
+                    properties:
+                      name:
+                        default: ""
+                        description: |-
+                          Name of the referent.
+                          This field is effectively required, but due to backwards compatibility is
+                          allowed to be empty. Instances of this type with an empty value here are
+                          almost certainly wrong.
+                          More info: https://kubernetes.io/docs/concepts/overview/working-with-objects/names/#names
+                        type: string
+                    type: object
+                    x-kubernetes-map-type: atomic
                   managementApiAuth:
                     description: ManagementApiAuth defines the authentication settings
                       for the management API in the Cassandra pods.
@@ -34315,6 +34349,10 @@ spec:
                         transited from one status to another.
                       format: date-time
                       type: string
+                    message:
+                      type: string
+                    reason:
+                      type: string
                     status:
                       type: string
                     type:
@@ -34585,6 +34623,264 @@ spec:
               error:
                 default: None
                 type: string
+              legacyRFDiscovery:
+                description: LegacyRFDiscovery records pre-creation legacy system-keyspace
+                  discovery state.
+                properties:
+                  acceptedSnapshot:
+                    description: LegacyRFSnapshot is the immutable accepted observation
+                      of a legacy Cassandra cluster.
+                    properties:
+                      acceptedAt:
+                        format: date-time
+                        type: string
+                      acceptedGeneration:
+                        format: int64
+                        type: integer
+                      acceptedManagedLocations:
+                        items:
+                          description: |-
+                            LegacyRFManagedLocation identifies one Kubernetes location in the managed-state safety domain
+                            and the Cassandra datacenter name owned by the resource at that location.
+                          properties:
+                            datacenterName:
+                              type: string
+                            k8sContext:
+                              type: string
+                            name:
+                              type: string
+                            namespace:
+                              type: string
+                          required:
+                          - k8sContext
+                          - name
+                          - namespace
+                          type: object
+                        type: array
+                      acceptedSeedDigest:
+                        type: string
+                      acceptedSeeds:
+                        items:
+                          type: string
+                        type: array
+                      attemptTrace:
+                        items:
+                          description: LegacyRFEndpointAttemptSummary preserves bounded
+                            discovery evidence without private failure details.
+                          properties:
+                            attemptIndex:
+                              type: integer
+                            endpoint:
+                              type: string
+                            outcome:
+                              description: LegacyRFEndpointAttemptOutcome is the sanitized
+                                public outcome of one ordered seed attempt.
+                              enum:
+                              - Failed
+                              - Accepted
+                              - Skipped
+                              type: string
+                            reason:
+                              description: LegacyRFDiscoveryReason is a stable, sanitized
+                                discovery outcome code.
+                              type: string
+                          required:
+                          - attemptIndex
+                          - endpoint
+                          - outcome
+                          type: object
+                        maxItems: 256
+                        type: array
+                      authoritativeEndpoint:
+                        type: string
+                      clusterUID:
+                        type: string
+                      discoveryLocation:
+                        description: |-
+                          LegacyRFManagedLocation identifies one Kubernetes location in the managed-state safety domain
+                          and the Cassandra datacenter name owned by the resource at that location.
+                        properties:
+                          datacenterName:
+                            type: string
+                          k8sContext:
+                            type: string
+                          name:
+                            type: string
+                          namespace:
+                            type: string
+                        required:
+                        - k8sContext
+                        - name
+                        - namespace
+                        type: object
+                      expectedClusterName:
+                        type: string
+                      hash:
+                        type: string
+                      identityFingerprint:
+                        type: string
+                      markerVersion:
+                        type: string
+                      observedExternalDatacenters:
+                        items:
+                          type: string
+                        type: array
+                      partitioner:
+                        type: string
+                      protocolVersion:
+                        type: string
+                      replication:
+                        description: |-
+                          LegacySystemKeyspaceReplication preserves the independent replication map for each
+                          supported legacy system keyspace. A nil map and an empty map remain distinct on the wire.
+                        properties:
+                          systemAuth:
+                            additionalProperties:
+                              format: int32
+                              type: integer
+                            type: object
+                          systemDistributed:
+                            additionalProperties:
+                              format: int32
+                              type: integer
+                            type: object
+                          systemTraces:
+                            additionalProperties:
+                              format: int32
+                              type: integer
+                            type: object
+                        required:
+                        - systemAuth
+                        - systemDistributed
+                        - systemTraces
+                        type: object
+                      schemaFingerprint:
+                        type: string
+                      secretBindings:
+                        items:
+                          description: |-
+                            LegacyRFSecretBinding identifies Secret metadata used by a discovery attempt without
+                            persisting any Secret data.
+                          properties:
+                            keys:
+                              items:
+                                type: string
+                              type: array
+                            name:
+                              type: string
+                            namespace:
+                              type: string
+                            purpose:
+                              type: string
+                            resourceVersion:
+                              type: string
+                            sourceContext:
+                              type: string
+                          required:
+                          - keys
+                          - name
+                          - namespace
+                          - purpose
+                          - resourceVersion
+                          - sourceContext
+                          type: object
+                        type: array
+                      serverType:
+                        type: string
+                      sourceVersion:
+                        type: string
+                      topologyFingerprint:
+                        type: string
+                      workerImageDigest:
+                        type: string
+                    required:
+                    - acceptedAt
+                    - acceptedGeneration
+                    - acceptedManagedLocations
+                    - acceptedSeedDigest
+                    - acceptedSeeds
+                    - attemptTrace
+                    - authoritativeEndpoint
+                    - clusterUID
+                    - discoveryLocation
+                    - expectedClusterName
+                    - hash
+                    - identityFingerprint
+                    - markerVersion
+                    - observedExternalDatacenters
+                    - partitioner
+                    - protocolVersion
+                    - replication
+                    - schemaFingerprint
+                    - serverType
+                    - sourceVersion
+                    - topologyFingerprint
+                    - workerImageDigest
+                    type: object
+                  currentManagedLocations:
+                    items:
+                      description: |-
+                        LegacyRFManagedLocation identifies one Kubernetes location in the managed-state safety domain
+                        and the Cassandra datacenter name owned by the resource at that location.
+                      properties:
+                        datacenterName:
+                          type: string
+                        k8sContext:
+                          type: string
+                        name:
+                          type: string
+                        namespace:
+                          type: string
+                      required:
+                      - k8sContext
+                      - name
+                      - namespace
+                      type: object
+                    type: array
+                  lastTransitionTime:
+                    format: date-time
+                    type: string
+                  managedCreationObserved:
+                    type: boolean
+                  managedLocationHistory:
+                    items:
+                      description: |-
+                        LegacyRFManagedLocation identifies one Kubernetes location in the managed-state safety domain
+                        and the Cassandra datacenter name owned by the resource at that location.
+                      properties:
+                        datacenterName:
+                          type: string
+                        k8sContext:
+                          type: string
+                        name:
+                          type: string
+                        namespace:
+                          type: string
+                      required:
+                      - k8sContext
+                      - name
+                      - namespace
+                      type: object
+                    type: array
+                  message:
+                    type: string
+                  observedGeneration:
+                    format: int64
+                    type: integer
+                  phase:
+                    description: LegacyRFDiscoveryPhase is the public lifecycle state
+                      of legacy replication discovery.
+                    type: string
+                  reason:
+                    description: LegacyRFDiscoveryReason is a stable, sanitized discovery
+                      outcome code.
+                    type: string
+                  retryCount:
+                    format: int32
+                    type: integer
+                  snapshotHash:
+                    type: string
+                type: object
               observedGeneration:
                 description: ObservedGeneration is the last observed generation of
                   the K8ssandraCluster.

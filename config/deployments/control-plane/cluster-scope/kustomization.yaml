@@ -42,3 +42,18 @@ patches:
     - op: replace
       path: /metadata/annotations/cert-manager.io~1inject-ca-from
       value: k8ssandra-operator/cass-operator-serving-cert
+- target:
+    kind: ClusterRole
+    name: cass-operator-manager-crrole
+  patch: |
+    - op: add
+      path: /rules/-
+      value:
+        apiGroups:
+        - events.k8s.io
+        resources:
+        - events
+        verbs:
+        - create
+        - patch
+        - update

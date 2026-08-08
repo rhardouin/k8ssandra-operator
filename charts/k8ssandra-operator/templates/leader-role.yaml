@@ -31,7 +31,6 @@ rules:
     - create
     - update
     - patch
-    - delete
 - apiGroups:
     - ""
   resources:

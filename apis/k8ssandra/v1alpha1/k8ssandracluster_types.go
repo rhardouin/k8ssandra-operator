@@ -92,6 +92,102 @@ func (in K8ssandraClusterSpec) UseExternalSecrets() bool {
 	return in.SecretsProvider != "" && in.SecretsProvider == "external"
 }
 
+// LegacyRFDiscoveryPhase is the public lifecycle state of legacy replication discovery.
+type LegacyRFDiscoveryPhase string
+
+// LegacyRFDiscoveryReason is a stable, sanitized discovery outcome code.
+type LegacyRFDiscoveryReason string
+
+// LegacySystemKeyspaceReplication preserves the independent replication map for each
+// supported legacy system keyspace. A nil map and an empty map remain distinct on the wire.
+type LegacySystemKeyspaceReplication struct {
+	SystemAuth        map[string]int32 `json:"systemAuth"`
+	SystemTraces      map[string]int32 `json:"systemTraces"`
+	SystemDistributed map[string]int32 `json:"systemDistributed"`
+}
+
+// LegacyRFSecretBinding identifies Secret metadata used by a discovery attempt without
+// persisting any Secret data.
+type LegacyRFSecretBinding struct {
+	Purpose         string   `json:"purpose"`
+	SourceContext   string   `json:"sourceContext"`
+	Namespace       string   `json:"namespace"`
+	Name            string   `json:"name"`
+	Keys            []string `json:"keys"`
+	ResourceVersion string   `json:"resourceVersion"`
+}
+
+// LegacyRFManagedLocation identifies one Kubernetes location in the managed-state safety domain
+// and the Cassandra datacenter name owned by the resource at that location.
+type LegacyRFManagedLocation struct {
+	K8sContext     string `json:"k8sContext"`
+	Namespace      string `json:"namespace"`
+	Name           string `json:"name"`
+	DatacenterName string `json:"datacenterName,omitempty"`
+}
+
+// LegacyRFEndpointAttemptOutcome is the sanitized public outcome of one ordered seed attempt.
+// +kubebuilder:validation:Enum=Failed;Accepted;Skipped
+type LegacyRFEndpointAttemptOutcome string
+
+const (
+	LegacyRFEndpointAttemptFailed   LegacyRFEndpointAttemptOutcome = "Failed"
+	LegacyRFEndpointAttemptAccepted LegacyRFEndpointAttemptOutcome = "Accepted"
+	LegacyRFEndpointAttemptSkipped  LegacyRFEndpointAttemptOutcome = "Skipped"
+)
+
+// LegacyRFEndpointAttemptSummary preserves bounded discovery evidence without private failure details.
+type LegacyRFEndpointAttemptSummary struct {
+	AttemptIndex int                            `json:"attemptIndex"`
+	Endpoint     string                         `json:"endpoint"`
+	Outcome      LegacyRFEndpointAttemptOutcome `json:"outcome"`
+	Reason       LegacyRFDiscoveryReason        `json:"reason,omitempty"`
+}
+
+// LegacyRFSnapshot is the immutable accepted observation of a legacy Cassandra cluster.
+type LegacyRFSnapshot struct {
+	ClusterUID            string   `json:"clusterUID"`
+	AcceptedGeneration    int64    `json:"acceptedGeneration"`
+	MarkerVersion         string   `json:"markerVersion"`
+	ProtocolVersion       string   `json:"protocolVersion"`
+	AcceptedSeeds         []string `json:"acceptedSeeds"`
+	AcceptedSeedDigest    string   `json:"acceptedSeedDigest"`
+	AuthoritativeEndpoint string   `json:"authoritativeEndpoint"`
+	// +kubebuilder:validation:MaxItems=256
+	AttemptTrace             []LegacyRFEndpointAttemptSummary `json:"attemptTrace"`
+	ExpectedClusterName      string                           `json:"expectedClusterName"`
+	ServerType               ServerDistribution               `json:"serverType"`
+	SourceVersion            string                           `json:"sourceVersion"`
+	Partitioner              string                           `json:"partitioner"`
+	IdentityFingerprint      string                           `json:"identityFingerprint"`
+	TopologyFingerprint      string                           `json:"topologyFingerprint"`
+	SchemaFingerprint        string                           `json:"schemaFingerprint"`
+	ObservedExternalDCs      []string                         `json:"observedExternalDatacenters"`
+	Replication              LegacySystemKeyspaceReplication  `json:"replication"`
+	SecretBindings           []LegacyRFSecretBinding          `json:"secretBindings,omitempty"`
+	DiscoveryLocation        LegacyRFManagedLocation          `json:"discoveryLocation"`
+	AcceptedManagedLocations []LegacyRFManagedLocation        `json:"acceptedManagedLocations"`
+	WorkerImageDigest        string                           `json:"workerImageDigest"`
+	AcceptedAt               metav1.Time                      `json:"acceptedAt"`
+	Hash                     string                           `json:"hash"`
+}
+
+// LegacyRFDiscoveryStatus records discovery progress and safety provenance separately
+// from managed Cassandra readiness.
+type LegacyRFDiscoveryStatus struct {
+	ObservedGeneration      int64                     `json:"observedGeneration,omitempty"`
+	Phase                   LegacyRFDiscoveryPhase    `json:"phase,omitempty"`
+	Reason                  LegacyRFDiscoveryReason   `json:"reason,omitempty"`
+	Message                 string                    `json:"message,omitempty"`
+	RetryCount              int32                     `json:"retryCount,omitempty"`
+	LastTransitionTime      *metav1.Time              `json:"lastTransitionTime,omitempty"`
+	SnapshotHash            string                    `json:"snapshotHash,omitempty"`
+	AcceptedSnapshot        *LegacyRFSnapshot         `json:"acceptedSnapshot,omitempty"`
+	CurrentManagedLocations []LegacyRFManagedLocation `json:"currentManagedLocations,omitempty"`
+	ManagedLocationHistory  []LegacyRFManagedLocation `json:"managedLocationHistory,omitempty"`
+	ManagedCreationObserved bool                      `json:"managedCreationObserved,omitempty"`
+}
+
 // K8ssandraClusterStatus defines the observed state of K8ssandraCluster
 type K8ssandraClusterStatus struct {
 	// +optional
@@ -110,12 +206,17 @@ type K8ssandraClusterStatus struct {
 
 	// ObservedGeneration is the last observed generation of the K8ssandraCluster.
 	ObservedGeneration int64 `json:"observedGeneration,omitempty"`
+
+	// LegacyRFDiscovery records pre-creation legacy system-keyspace discovery state.
+	// +optional
+	LegacyRFDiscovery *LegacyRFDiscoveryStatus `json:"legacyRFDiscovery,omitempty"`
 }
 
 type K8ssandraClusterConditionType string
 
 const (
-	ClusterRequiresUpdate K8ssandraClusterConditionType = "RequiresUpdate"
+	ClusterRequiresUpdate          K8ssandraClusterConditionType = "RequiresUpdate"
+	SystemKeyspaceReplicationReady K8ssandraClusterConditionType = "SystemKeyspaceReplicationReady"
 )
 
 type DecommissionProgress string
@@ -133,8 +234,10 @@ const (
 )
 
 type K8ssandraClusterCondition struct {
-	Type   K8ssandraClusterConditionType `json:"type"`
-	Status corev1.ConditionStatus        `json:"status"`
+	Type    K8ssandraClusterConditionType `json:"type"`
+	Status  corev1.ConditionStatus        `json:"status"`
+	Reason  string                        `json:"reason,omitempty"`
+	Message string                        `json:"message,omitempty"`
 
 	// LastTransitionTime is the last time the condition transited from one status to another.
 	// +optional
@@ -257,6 +360,18 @@ type CassandraClusterTemplate struct {
 	// can resolve hostnames for the remote Cassandra cluster, then you can specify hostnames
 	// here; otherwise, use IP addresses.
 	AdditionalSeeds []string `json:"additionalSeeds,omitempty"`
+
+	// LegacyCqlCredentialsSecretRef references credentials used only to discover a legacy
+	// Cassandra cluster. The Secret must be in the K8ssandraCluster namespace.
+	// +optional
+	LegacyCqlCredentialsSecretRef *corev1.LocalObjectReference `json:"legacyCqlCredentialsSecretRef,omitempty"`
+
+	// LegacyCqlTLSSecretRef references source TLS material used only to discover a legacy
+	// Cassandra cluster. The Secret must be in the K8ssandraCluster namespace and contain
+	// PEM-encoded ca.crt data; optional PEM-encoded tls.crt and tls.key entries must be
+	// provided together. Secret content validation occurs during controller reconciliation.
+	// +optional
+	LegacyCqlTLSSecretRef *corev1.LocalObjectReference `json:"legacyCqlTLSSecretRef,omitempty"`
 
 	// Internode encryption stores which are used by Cassandra and Stargate.
 	// +optional

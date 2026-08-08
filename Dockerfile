@@ -13,12 +13,14 @@ RUN go mod download
 
 # Copy the go source
 COPY main.go main.go
+COPY cmd/ cmd/
 COPY apis/ apis/
 COPY pkg/ pkg/
 COPY controllers/ controllers/
 
 # Build
-RUN CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} go build -a -o manager main.go
+RUN CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} go build -a -o manager main.go \
+    && CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} go build -a -o legacy-rf-discovery ./cmd/legacy-rf-discovery
 
 # Build the UBI image
 FROM redhat/ubi9-micro:latest
@@ -35,6 +37,7 @@ LABEL description="K8ssandra is a cloud-native distribution of Apache CassandraÂ
 
 WORKDIR /
 COPY --from=builder /workspace/manager /manager
+COPY --from=builder /workspace/legacy-rf-discovery /legacy-rf-discovery
 COPY ./LICENSE /licenses/LICENSE
 
 USER 65532:65532

@@ -22,6 +22,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/rand"
+	"k8s.io/client-go/util/retry"
 	"k8s.io/utils/ptr"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 )
@@ -370,12 +371,14 @@ func configureSrcDcForRebuild(ctx context.Context, t *testing.T, f *framework.Fr
 	dc3Key := framework.ClusterKey{NamespacedName: types.NamespacedName{Namespace: kc.Namespace, Name: "dc3"}, K8sContext: f.DataPlaneContexts[2]}
 
 	kcKey := utils.GetKey(kc)
-	kc = &api.K8ssandraCluster{}
-	err := f.Client.Get(ctx, kcKey, kc)
-	require.NoError(err, "failed to get K8ssandraCluster")
-
-	kc.Spec.Cassandra.Rebuild = &api.Rebuild{SourceDC: "dc2"}
-	err = f.Client.Update(ctx, kc)
+	err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		kc = &api.K8ssandraCluster{}
+		if err := f.Client.Get(ctx, kcKey, kc); err != nil {
+			return err
+		}
+		kc.Spec.Cassandra.Rebuild = &api.Rebuild{SourceDC: "dc2"}
+		return f.Client.Update(ctx, kc)
+	})
 	require.NoError(err, "failed to add rebuild filed to K8ssandraCluster", kc.Spec.Cassandra.Rebuild.SourceDC)
 
 	addDcToCluster(ctx, t, f, kc, dc3Key)

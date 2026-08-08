@@ -4,12 +4,14 @@ import (
 	"context"
 	"fmt"
 	"strings"
+	"sync"
 
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/client-go/rest"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/builder"
 	"sigs.k8s.io/controller-runtime/pkg/cache"
@@ -32,11 +34,12 @@ const (
 )
 
 type ClientConfigReconciler struct {
-	Scheme       *runtime.Scheme
-	ClientCache  *clientcache.ClientCache
-	shutdownFunc context.CancelFunc
+	Scheme          *runtime.Scheme
+	ClientCache     *clientcache.ClientCache
+	shutdownFunc    context.CancelFunc
+	newDirectClient func(*rest.Config, client.Options) (client.Client, error)
 
-	// filterMutex  sync.RWMutex
+	filterMutex  sync.RWMutex
 	secretFilter map[types.NamespacedName]types.NamespacedName
 }
 
@@ -89,17 +92,21 @@ func (r *ClientConfigReconciler) Reconcile(ctx context.Context, req ctrl.Request
 // SetupWithManager will only set this controller to listen in control plane cluster
 func (r *ClientConfigReconciler) SetupWithManager(mgr ctrl.Manager, cancelFunc context.CancelFunc) error {
 	r.shutdownFunc = cancelFunc
+	r.filterMutex.Lock()
 	if r.secretFilter == nil {
 		r.secretFilter = make(map[types.NamespacedName]types.NamespacedName)
 	}
+	r.filterMutex.Unlock()
 
 	// We should only reconcile objects that match the rules
 	toMatchingClientConfig := func(ctx context.Context, secret client.Object) []reconcile.Request {
 		requests := []reconcile.Request{}
 		secretKey := types.NamespacedName{Name: secret.GetName(), Namespace: secret.GetNamespace()}
+		r.filterMutex.RLock()
 		if clientConfigName, found := r.secretFilter[secretKey]; found {
 			requests = append(requests, reconcile.Request{NamespacedName: clientConfigName})
 		}
+		r.filterMutex.RUnlock()
 		return requests
 	}
 
@@ -138,7 +145,9 @@ func (r *ClientConfigReconciler) InitClientConfigs(ctx context.Context, mgr ctrl
 	additionalClusters := make([]cluster.Cluster, 0, len(clientConfigs))
 
 	// TODO Secret could point to multiple clientConfigs. Shouldn't matter in our current use-case
+	r.filterMutex.Lock()
 	r.secretFilter = make(map[types.NamespacedName]types.NamespacedName, len(clientConfigs))
+	r.filterMutex.Unlock()
 
 	for _, cCfg := range clientConfigs {
 		logger.V(1).Info(fmt.Sprintf("Initializing client config %s namespaces %s", cCfg.Name, namespaces))
@@ -189,12 +198,14 @@ func (r *ClientConfigReconciler) initAdditionalClusterConfig(ctx context.Context
 	}
 
 	// Add the Secret to the cache
+	r.filterMutex.Lock()
 	r.secretFilter[secretName] = cCfgName
+	r.filterMutex.Unlock()
 
 	// Create clients and add them to the client cache
 	cfg, err := r.ClientCache.GetRestConfig(&cCfg)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("get REST config for context %q: %w", cCfg.GetContextName(), err)
 	}
 
 	// Add cluster to the manager
@@ -211,14 +222,24 @@ func (r *ClientConfigReconciler) initAdditionalClusterConfig(ctx context.Context
 	})
 
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("create cached cluster for context %q: %w", cCfg.GetContextName(), err)
 	}
 
-	r.ClientCache.AddClient(cCfg.GetContextName(), c.GetClient())
-
+	newDirectClient := r.newDirectClient
+	if newDirectClient == nil {
+		newDirectClient = client.New
+	}
+	directClient, err := newDirectClient(cfg, client.Options{Scheme: r.Scheme})
+	if err != nil {
+		return nil, fmt.Errorf("create direct client for context %q: %w", cCfg.GetContextName(), err)
+	}
 	err = mgr.Add(c)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("register cached cluster for context %q: %w", cCfg.GetContextName(), err)
+	}
+
+	if err := r.ClientCache.AddClientPair(cCfg.GetContextName(), c.GetClient(), directClient); err != nil {
+		return nil, fmt.Errorf("register client pair for context %q: %w", cCfg.GetContextName(), err)
 	}
 
 	return c, nil

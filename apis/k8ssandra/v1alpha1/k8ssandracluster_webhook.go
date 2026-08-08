@@ -19,6 +19,7 @@ package v1alpha1
 import (
 	"context"
 	"fmt"
+	"net/netip"
 	"strings"
 
 	"github.com/Masterminds/semver/v3"
@@ -27,6 +28,8 @@ import (
 	medusaapi "github.com/k8ssandra/k8ssandra-operator/apis/medusa/v1alpha1"
 	reaperapi "github.com/k8ssandra/k8ssandra-operator/apis/reaper/v1alpha1"
 
+	admissionv1 "k8s.io/api/admission/v1"
+	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/util/validation"
 
@@ -38,7 +41,6 @@ import (
 )
 
 var (
-	clientCache                 *clientcache.ClientCache
 	ErrNumTokens                = fmt.Errorf("num_tokens value can't be changed")
 	ErrReaperKeyspace           = fmt.Errorf("reaper keyspace can not be changed")
 	ErrNoStorageConfig          = fmt.Errorf("storageConfig must be defined at cluster level or dc level")
@@ -58,9 +60,16 @@ var (
 var webhookLog = logf.Log.WithName("k8ssandracluster-webhook")
 
 func SetupK8ssandraClusterWebhookWithManager(mgr ctrl.Manager, cCache *clientcache.ClientCache) error {
-	clientCache = cCache
+	if mgr == nil {
+		return errors.New("setup K8ssandraCluster webhook: manager is required")
+	}
+	if cCache == nil {
+		return errors.New("setup K8ssandraCluster webhook: client cache is required")
+	}
+	validator := &K8ssandraClusterCustomValidator{clientCache: cCache}
 	return ctrl.NewWebhookManagedBy(mgr, &K8ssandraCluster{}).
-		WithValidator(&K8ssandraClusterCustomValidator{}).
+		WithDefaulter(&K8ssandraClusterCustomDefaulter{}).
+		WithValidator(validator).
 		Complete()
 }
 
@@ -71,21 +80,63 @@ type K8ssandraClusterCustomDefaulter struct {
 
 // Default implements webhook.Defaulter so a webhook will be registered for the type
 func (r *K8ssandraClusterCustomDefaulter) Default(ctx context.Context, obj *K8ssandraCluster) error {
+	request, err := admission.RequestFromContext(ctx)
+	if err != nil {
+		return fmt.Errorf("read K8ssandraCluster admission request: %w", err)
+	}
+	if request.Operation != admissionv1.Create {
+		return nil
+	}
+	if _, found := obj.GetAnnotations()[LegacyRFDiscoveryMarkerAnnotation]; found {
+		return fmt.Errorf("annotation %q is a reserved discovery marker and cannot be client supplied", LegacyRFDiscoveryMarkerAnnotation)
+	}
+	metav1.SetMetaDataAnnotation(&obj.ObjectMeta, LegacyRFDiscoveryMarkerAnnotation, LegacyRFDiscoveryMarkerVersion)
 	return nil
 }
+
+//+kubebuilder:webhook:path=/mutate-k8ssandra-io-v1alpha1-k8ssandracluster,mutating=true,failurePolicy=fail,sideEffects=None,groups=k8ssandra.io,resources=k8ssandraclusters,verbs=create;update,versions=v1alpha1,name=mk8ssandracluster.kb.io,admissionReviewVersions=v1
 
 //+kubebuilder:webhook:path=/validate-k8ssandra-io-v1alpha1-k8ssandracluster,mutating=false,failurePolicy=fail,sideEffects=None,groups=k8ssandra.io,resources=k8ssandraclusters,verbs=create;update,versions=v1alpha1,name=vk8ssandracluster.kb.io,admissionReviewVersions=v1
 
 var _ admission.Validator[*K8ssandraCluster] = &K8ssandraClusterCustomValidator{}
 
+// +kubebuilder:object:generate=false
 type K8ssandraClusterCustomValidator struct {
+	clientCache *clientcache.ClientCache
 }
 
 // ValidateCreate implements webhook.Validator so a webhook will be registered for the type
 func (v *K8ssandraClusterCustomValidator) ValidateCreate(ctx context.Context, obj *K8ssandraCluster) (admission.Warnings, error) {
 	webhookLog.Info("validate K8ssandraCluster create", "K8ssandraCluster", obj.Name)
 
-	return ValidateDeprecatedFieldUsage(obj), validateK8ssandraCluster(obj)
+	if err := v.validateCluster(obj); err != nil {
+		return nil, err
+	}
+	return ValidateDeprecatedFieldUsage(obj), nil
+}
+
+func (v *K8ssandraClusterCustomValidator) validateCluster(cluster *K8ssandraCluster) error {
+	if err := validateLegacyRFDiscovery(cluster); err != nil {
+		return err
+	}
+	if v.clientCache != nil {
+		if err := validateK8sContexts(cluster, v.clientCache); err != nil {
+			return err
+		}
+	}
+	return validateK8ssandraCluster(cluster)
+}
+
+func validateK8sContexts(cluster *K8ssandraCluster, clientCache *clientcache.ClientCache) error {
+	if cluster.Spec.Cassandra == nil {
+		return nil
+	}
+	for _, datacenter := range cluster.Spec.Cassandra.Datacenters {
+		if _, err := clientCache.GetRemoteClient(datacenter.K8sContext); err != nil {
+			return errors.Wrap(err, fmt.Sprintf("unable to find k8sContext %s from ClientConfigs", datacenter.K8sContext))
+		}
+	}
+	return nil
 }
 
 func validateK8ssandraCluster(r *K8ssandraCluster) error {
@@ -96,13 +147,6 @@ func validateK8ssandraCluster(r *K8ssandraCluster) error {
 			return fmt.Errorf(
 				"invalid DC name (you might want to use datacenterName to override the name used in Cassandra): %s",
 				strings.Join(dns1035Errs, ", "))
-		}
-
-		// Verify given k8s-context is correct
-		_, err := clientCache.GetRemoteClient(dc.K8sContext)
-		if err != nil {
-			// No client found for this context name, reject
-			return errors.Wrap(err, fmt.Sprintf("unable to find k8sContext %s from ClientConfigs", dc.K8sContext))
 		}
 
 		// StorageConfig must be set at DC or Cluster level
@@ -177,7 +221,10 @@ func validateStatefulsetNameSize(r *K8ssandraCluster) error {
 func (v *K8ssandraClusterCustomValidator) ValidateUpdate(ctx context.Context, oldCluster *K8ssandraCluster, newCluster *K8ssandraCluster) (admission.Warnings, error) {
 	webhookLog.Info("validate K8ssandraCluster update", "K8ssandraCluster", newCluster.Name)
 
-	if err := validateK8ssandraCluster(newCluster); err != nil {
+	if err := validateLegacyRFMarkerUpdate(oldCluster, newCluster); err != nil {
+		return nil, err
+	}
+	if err := v.validateCluster(newCluster); err != nil {
 		return nil, err
 	}
 
@@ -214,6 +261,73 @@ func (v *K8ssandraClusterCustomValidator) ValidateUpdate(ctx context.Context, ol
 	}
 
 	return ValidateDeprecatedFieldUsage(newCluster), nil
+}
+
+func validateLegacyRFDiscovery(cluster *K8ssandraCluster) error {
+	marker, marked := cluster.GetAnnotations()[LegacyRFDiscoveryMarkerAnnotation]
+	if marked && marker != LegacyRFDiscoveryMarkerVersion {
+		return fmt.Errorf("discovery marker must equal supported version %q", LegacyRFDiscoveryMarkerVersion)
+	}
+	if cluster.Spec.Cassandra == nil {
+		return nil
+	}
+	if serverType := cluster.Spec.Cassandra.ServerType; serverType != "" && serverType != ServerDistributionCassandra {
+		return nil
+	}
+	if err := validateLegacyRFSecretReference(
+		cluster.Spec.Cassandra.LegacyCqlCredentialsSecretRef,
+		"legacy CQL credential Secret",
+	); err != nil {
+		return err
+	}
+	if err := validateLegacyRFSecretReference(
+		cluster.Spec.Cassandra.LegacyCqlTLSSecretRef,
+		"legacy CQL TLS Secret",
+	); err != nil {
+		return err
+	}
+	if len(cluster.Spec.Cassandra.AdditionalSeeds) == 0 {
+		return nil
+	}
+	if len(cluster.Spec.Cassandra.AdditionalSeeds) > LegacyRFDiscoveryMaxSeeds {
+		return fmt.Errorf("legacy RF discovery supports at most %d additionalSeeds", LegacyRFDiscoveryMaxSeeds)
+	}
+	if cluster.Spec.UseExternalSecrets() {
+		return errors.New("legacy RF discovery requires the internal Secrets provider")
+	}
+	return validateLegacyRFSeeds(cluster.Spec.Cassandra.AdditionalSeeds)
+}
+
+func validateLegacyRFSecretReference(reference *corev1.LocalObjectReference, fieldName string) error {
+	if reference == nil {
+		return nil
+	}
+	if validationErrors := validation.IsDNS1123Subdomain(reference.Name); len(validationErrors) > 0 {
+		return fmt.Errorf("%s name is invalid: %s", fieldName, strings.Join(validationErrors, ", "))
+	}
+	return nil
+}
+
+func validateLegacyRFSeeds(seeds []string) error {
+	for index, seed := range seeds {
+		if seed == "" || strings.TrimSpace(seed) != seed {
+			return fmt.Errorf("additionalSeeds[%d] must be an IP literal without whitespace or a port", index)
+		}
+		address, err := netip.ParseAddr(seed)
+		if err != nil || address.Zone() != "" {
+			return fmt.Errorf("additionalSeeds[%d] must be an IP literal without a port or zone", index)
+		}
+	}
+	return nil
+}
+
+func validateLegacyRFMarkerUpdate(oldCluster, newCluster *K8ssandraCluster) error {
+	oldMarker, oldMarked := oldCluster.GetAnnotations()[LegacyRFDiscoveryMarkerAnnotation]
+	newMarker, newMarked := newCluster.GetAnnotations()[LegacyRFDiscoveryMarkerAnnotation]
+	if oldMarked != newMarked || oldMarker != newMarker {
+		return errors.New("legacy RF discovery marker is immutable and controller-owned")
+	}
+	return nil
 }
 
 func validateUpdateNumTokens(

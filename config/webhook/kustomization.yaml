@@ -5,6 +5,24 @@ resources:
 configurations:
 - kustomizeconfig.yaml
 
+patches:
+- target:
+    group: admissionregistration.k8s.io
+    version: v1
+    kind: MutatingWebhookConfiguration
+    name: mutating-webhook-configuration
+  patch: |-
+    - op: add
+      path: /webhooks/1/objectSelector
+      value:
+        matchLabels:
+          app.kubernetes.io/created-by: cass-operator
+        matchExpressions:
+        - key: control-plane
+          operator: NotIn
+          values:
+          - k8ssandra-operator
+
 namePrefix: k8ssandra-operator-
 
 patchesJson6902:
@@ -29,8 +47,3 @@ patchesJson6902:
     - op: replace
       path: /webhooks/0/clientConfig/service/name
       value: k8ssandra-operator-webhook-service
-    - op: add
-      path: /webhooks/0/objectSelector
-      value:
-        matchLabels:
-          app.kubernetes.io/created-by: cass-operator

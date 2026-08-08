@@ -420,15 +420,16 @@ func (f *fakeMedusaClientFactory) GetRequestedBackups(dc string) map[string][]st
 	requestedBackups := make(map[string][]string)
 	for k, v := range f.clients {
 		if v.DcName == dc {
-			requestedBackups[k] = v.RequestedBackups
+			requestedBackups[k] = v.requestedBackupsSnapshot()
 		}
 	}
 	return requestedBackups
 }
 
 type fakeMedusaClient struct {
-	RequestedBackups []string
-	DcName           string
+	requestedBackupsMutex sync.RWMutex
+	RequestedBackups      []string
+	DcName                string
 }
 
 func newFakeMedusaClient(dcName string) *fakeMedusaClient {
@@ -442,7 +443,15 @@ func newFakeMedusaClient(dcName string) *fakeMedusaClient {
 }
 
 func (c *fakeMedusaClient) Clear() {
+	c.requestedBackupsMutex.Lock()
+	defer c.requestedBackupsMutex.Unlock()
 	c.RequestedBackups = make([]string, 0)
+}
+
+func (c *fakeMedusaClient) requestedBackupsSnapshot() []string {
+	c.requestedBackupsMutex.RLock()
+	defer c.requestedBackupsMutex.RUnlock()
+	return append([]string(nil), c.RequestedBackups...)
 }
 
 func (c *fakeMedusaClient) Close() error {
@@ -450,14 +459,17 @@ func (c *fakeMedusaClient) Close() error {
 }
 
 func (c *fakeMedusaClient) CreateBackup(ctx context.Context, name string, backupType string) (*medusa.BackupResponse, error) {
+	c.requestedBackupsMutex.Lock()
+	defer c.requestedBackupsMutex.Unlock()
 	c.RequestedBackups = append(c.RequestedBackups, name)
 	return &medusa.BackupResponse{BackupName: name, Status: medusa.StatusType_IN_PROGRESS}, nil
 }
 
 func (c *fakeMedusaClient) GetBackups(ctx context.Context) ([]*medusa.BackupSummary, error) {
+	requestedBackups := c.requestedBackupsSnapshot()
 	backups := make([]*medusa.BackupSummary, 0)
 
-	for _, name := range c.RequestedBackups {
+	for _, name := range requestedBackups {
 		// return status based on the backup name
 		// since we're implementing altogether different method of the Medusa client, we cannot reuse the BackupStatus logic
 		// but we still want to "mock" failing backups
@@ -543,6 +555,8 @@ func (c *fakeMedusaClient) BackupStatus(ctx context.Context, name string) (*medu
 }
 
 func (c *fakeMedusaClient) PurgeBackups(ctx context.Context) (*medusa.PurgeBackupsResponse, error) {
+	c.requestedBackupsMutex.Lock()
+	defer c.requestedBackupsMutex.Unlock()
 	size := len(c.RequestedBackups)
 	if size > fakeMaxBackupCount {
 		c.RequestedBackups = c.RequestedBackups[size-fakeMaxBackupCount:]

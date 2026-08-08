@@ -70,6 +70,10 @@ func (r *K8ssandraClusterReconciler) reconcileDatacenters(ctx context.Context, k
 
 	// Reconcile CassandraDatacenter objects only
 	for idx, dcConfig := range sortDatacentersByPriority(dcConfigs) {
+		additionalSeeds, err := acceptedLegacyRFSeeds(kc, dcConfig.AdditionalSeeds)
+		if err != nil {
+			return result.Error(err), actualDcs
+		}
 		if !kc.Spec.UseExternalSecrets() && !secret.HasReplicatedSecrets(ctx, r.Client, kcKey, dcConfig.K8sContext) {
 			// ReplicatedSecret has not replicated yet, wait until it has
 			logger.Info("Waiting for replication to complete")
@@ -100,7 +104,9 @@ func (r *K8ssandraClusterReconciler) reconcileDatacenters(ctx context.Context, k
 			return vectorResult, actualDcs
 		}
 
-		desiredDc, err := cassandra.NewDatacenter(kcKey, dcConfig)
+		desiredConfig := *dcConfig
+		desiredConfig.AdditionalSeeds = additionalSeeds
+		desiredDc, err := cassandra.NewDatacenter(kcKey, &desiredConfig)
 		if err != nil {
 			dcLogger.Error(err, "Failed to create new CassandraDatacenter")
 			return result.Error(err), actualDcs
@@ -134,6 +140,7 @@ func (r *K8ssandraClusterReconciler) reconcileDatacenters(ctx context.Context, k
 		// merge in common L&A from the k8ssandra spec
 		desiredDc.SetLabels(goalesce.MustDeepMerge(desiredDc.GetLabels(), kc.Spec.Cassandra.Meta.Labels))
 		desiredDc.SetAnnotations(goalesce.MustDeepMerge(desiredDc.GetAnnotations(), kc.Spec.Cassandra.Meta.Annotations))
+		applyLegacyRFUserCreationGate(kc, desiredDc)
 
 		// Note: desiredDc should not be modified from now on
 		annotations.AddHashAnnotation(desiredDc)
@@ -144,7 +151,7 @@ func (r *K8ssandraClusterReconciler) reconcileDatacenters(ctx context.Context, k
 
 		actualDc := &cassdcapi.CassandraDatacenter{}
 
-		if recResult := r.reconcileSeedsEndpoints(ctx, kc, desiredDc, seeds, dcConfig.AdditionalSeeds, remoteClient, dcLogger); recResult.Completed() {
+		if recResult := r.reconcileSeedsEndpoints(ctx, kc, desiredDc, seeds, additionalSeeds, remoteClient, dcLogger); recResult.Completed() {
 			return recResult, actualDcs
 		}
 
@@ -210,6 +217,9 @@ func (r *K8ssandraClusterReconciler) reconcileDatacenters(ctx context.Context, k
 				}
 			} else {
 				if !cassandra.DatacenterReady(actualDc) {
+					if recResult := r.reconcileLegacyRFPreReadySchema(ctx, kc, actualDc, remoteClient, dcLogger); recResult.Completed() {
+						return recResult, actualDcs
+					}
 					dcLogger.Info("Waiting for datacenter to satisfy Ready condition")
 					return result.Done(), actualDcs
 				}
@@ -234,6 +244,11 @@ func (r *K8ssandraClusterReconciler) reconcileDatacenters(ctx context.Context, k
 				if recResult := r.checkSchemas(ctx, kc, actualDc, remoteClient, dcLogger); recResult.Completed() {
 					return recResult, actualDcs
 				}
+				if released, err := releaseLegacyRFUserCreationIfReady(ctx, kc, remoteClient, actualDc); err != nil {
+					return result.Error(err), actualDcs
+				} else if released {
+					return result.RequeueSoon(r.DefaultDelay), actualDcs
+				}
 
 				if annotations.HasAnnotationWithValue(kc, api.RebuildDcAnnotation, dcKey.Name) {
 					if recResult := r.reconcileDcRebuild(ctx, kc, actualDc, remoteClient, dcLogger); recResult.Completed() {
@@ -248,7 +263,7 @@ func (r *K8ssandraClusterReconciler) reconcileDatacenters(ctx context.Context, k
 					return result.Error(err), actualDcs
 				}
 				// cassdc doesn't exist, we'll create it
-				if err = remoteClient.Create(ctx, desiredDc); err != nil {
+				if err = r.createManagedDatacenter(ctx, kc, dcConfig, desiredDc, remoteClient); err != nil {
 					dcLogger.Error(err, "Failed to create datacenter")
 					return result.Error(err), actualDcs
 				}
@@ -316,6 +331,55 @@ func (r *K8ssandraClusterReconciler) reconcileDatacenters(ctx context.Context, k
 	}
 
 	return result.Continue(), actualDcs
+}
+
+func legacyRFNeedsUserCreationSkip(cluster *api.K8ssandraCluster) bool {
+	return cluster != nil &&
+		cluster.Status.LegacyRFDiscovery != nil &&
+		cluster.Status.LegacyRFDiscovery.Phase == api.LegacyRFDiscoveryPhaseAccepted &&
+		(!cluster.Spec.IsAuthEnabled() || !legacyRFSchemaConditionReady(cluster))
+}
+
+func applyLegacyRFUserCreationGate(cluster *api.K8ssandraCluster, datacenter *cassdcapi.CassandraDatacenter) {
+	if !legacyRFNeedsUserCreationSkip(cluster) {
+		return
+	}
+	if datacenter.Annotations == nil {
+		datacenter.Annotations = map[string]string{}
+	}
+	if datacenter.Annotations[cassdcapi.SkipUserCreationAnnotation] == "true" {
+		return
+	}
+	datacenter.Annotations[cassdcapi.SkipUserCreationAnnotation] = "true"
+	datacenter.Annotations[legacyRFUserCreationGateOwnerAnnotation] = "true"
+}
+
+func acceptedLegacyRFSeeds(cluster *api.K8ssandraCluster, unmarked []string) ([]string, error) {
+	if !legacyRFDiscoveryQualifies(cluster) {
+		return append([]string(nil), unmarked...), nil
+	}
+	status := cluster.Status.LegacyRFDiscovery
+	if !legacyRFSnapshotIsIntact(status) {
+		return nil, fmt.Errorf("resolve accepted legacy RF seeds: accepted snapshot is missing or invalid")
+	}
+	return append([]string(nil), status.AcceptedSnapshot.AcceptedSeeds...), nil
+}
+
+func (r *K8ssandraClusterReconciler) createManagedDatacenter(ctx context.Context, cluster *api.K8ssandraCluster, config *cassandra.DatacenterConfig, desired *cassdcapi.CassandraDatacenter, remoteClient client.Client) error {
+	if !legacyRFDiscoveryQualifies(cluster) {
+		return remoteClient.Create(ctx, desired)
+	}
+	if r.LegacyRFDiscovery == nil {
+		return fmt.Errorf("create managed datacenter: legacy RF discovery integration is required")
+	}
+	target := api.LegacyRFManagedLocation{
+		K8sContext: config.K8sContext, Namespace: desired.Namespace, Name: desired.Name,
+		DatacenterName: desired.DatacenterName(),
+	}
+	return r.LegacyRFDiscovery.AuthorizeManagedCreation(ctx, cluster, target, func(ctx context.Context, acceptedSeeds []string) error {
+		desired.Spec.AdditionalSeeds = append([]string(nil), acceptedSeeds...)
+		return remoteClient.Create(ctx, desired)
+	})
 }
 
 func (r *K8ssandraClusterReconciler) setStatusForDatacenter(kc *api.K8ssandraCluster, dc *cassdcapi.CassandraDatacenter, targetContext string) {

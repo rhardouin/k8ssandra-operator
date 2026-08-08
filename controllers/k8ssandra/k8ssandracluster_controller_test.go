@@ -3,6 +3,7 @@ package k8ssandra
 import (
 	"context"
 	"encoding/json"
+	stderrors "errors"
 	"fmt"
 	"math/rand"
 	"os"
@@ -12,12 +13,14 @@ import (
 	"testing"
 	"time"
 
+	"github.com/go-logr/logr"
 	cassimages "github.com/k8ssandra/cass-operator/pkg/images"
 	medusaapi "github.com/k8ssandra/k8ssandra-operator/apis/medusa/v1alpha1"
 	telemetryapi "github.com/k8ssandra/k8ssandra-operator/apis/telemetry/v1alpha1"
 	"github.com/k8ssandra/k8ssandra-operator/pkg/encryption"
 	"github.com/k8ssandra/k8ssandra-operator/pkg/images"
 	"github.com/k8ssandra/k8ssandra-operator/pkg/labels"
+	"github.com/k8ssandra/k8ssandra-operator/pkg/result"
 	"github.com/k8ssandra/k8ssandra-operator/pkg/utils"
 
 	promapi "github.com/prometheus-operator/prometheus-operator/pkg/apis/monitoring/v1"
@@ -30,25 +33,262 @@ import (
 	"github.com/k8ssandra/k8ssandra-operator/pkg/cassandra"
 	"github.com/k8ssandra/k8ssandra-operator/pkg/clientcache"
 	"github.com/k8ssandra/k8ssandra-operator/pkg/config"
+	"github.com/k8ssandra/k8ssandra-operator/pkg/discovery"
 	"github.com/k8ssandra/k8ssandra-operator/pkg/k8ssandra"
 	"github.com/k8ssandra/k8ssandra-operator/pkg/secret"
 	"github.com/k8ssandra/k8ssandra-operator/pkg/unstructured"
 	"github.com/k8ssandra/k8ssandra-operator/test/framework"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/kubernetes/scheme"
+	"k8s.io/client-go/tools/record"
+	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	fakeclient "sigs.k8s.io/controller-runtime/pkg/client/fake"
 	"sigs.k8s.io/controller-runtime/pkg/cluster"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 	"sigs.k8s.io/controller-runtime/pkg/manager"
+	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	testutils "github.com/k8ssandra/k8ssandra-operator/pkg/test"
 )
+
+type recordingLegacyRFIntegration struct {
+	gateResult result.ReconcileResult
+	gateCalls  int
+}
+
+func (integration *recordingLegacyRFIntegration) ReconcileGate(
+	_ context.Context,
+	_ *api.K8ssandraCluster,
+	_ logr.Logger,
+) result.ReconcileResult {
+	integration.gateCalls++
+	return integration.gateResult
+}
+
+func (integration *recordingLegacyRFIntegration) AuthorizeManagedCreation(
+	_ context.Context,
+	_ *api.K8ssandraCluster,
+	_ api.LegacyRFManagedLocation,
+	create LegacyRFManagedCreateCallback,
+) error {
+	return create(context.Background(), []string{"192.0.2.10", "2001:db8::10"})
+}
+
+func TestLegacyRFControllerGateRunsBeforeForbiddenCreation(t *testing.T) {
+	integration := &recordingLegacyRFIntegration{gateResult: result.RequeueSoon(time.Second)}
+	reconciler := &K8ssandraClusterReconciler{LegacyRFDiscovery: integration}
+	cluster := &api.K8ssandraCluster{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "migration", Namespace: "test", Finalizers: []string{k8ssandra.K8ssandraClusterFinalizer},
+			Annotations: map[string]string{api.LegacyRFDiscoveryMarkerAnnotation: api.LegacyRFDiscoveryMarkerVersion},
+		},
+		Spec: api.K8ssandraClusterSpec{Cassandra: &api.CassandraClusterTemplate{
+			AdditionalSeeds: []string{"192.0.2.10"}, Datacenters: []api.CassandraDatacenterTemplate{{Meta: api.EmbeddedObjectMeta{Name: "dc1"}, Size: 1}},
+		}},
+	}
+
+	actual, err := reconciler.reconcile(context.Background(), cluster, logr.Discard())
+
+	require.NoError(t, err)
+	require.Equal(t, ctrl.Result{Requeue: true, RequeueAfter: time.Second}, actual)
+	require.Equal(t, 1, integration.gateCalls)
+}
+
+func TestLegacyRFWatchMappingsEnqueueOnlyExactOwner(t *testing.T) {
+	ownerLabels := labels.WatchedByK8ssandraClusterLabels(types.NamespacedName{Namespace: "control", Name: "migration"})
+	job := &batchv1.Job{ObjectMeta: metav1.ObjectMeta{Name: "attempt", Namespace: "data", Labels: ownerLabels}}
+	unrelated := &corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Name: "unrelated", Namespace: "data"}}
+
+	require.Equal(t, []reconcile.Request{{NamespacedName: types.NamespacedName{Namespace: "control", Name: "migration"}}}, legacyRFOwnerRequests(job))
+	require.Empty(t, legacyRFOwnerRequests(unrelated))
+
+	clusters := []api.K8ssandraCluster{
+		{ObjectMeta: metav1.ObjectMeta{Name: "migration", Namespace: "control"}, Spec: api.K8ssandraClusterSpec{Cassandra: &api.CassandraClusterTemplate{LegacyCqlCredentialsSecretRef: &corev1.LocalObjectReference{Name: "legacy-cql"}, LegacyCqlTLSSecretRef: &corev1.LocalObjectReference{Name: "legacy-tls"}}}},
+		{ObjectMeta: metav1.ObjectMeta{Name: "other", Namespace: "control"}, Spec: api.K8ssandraClusterSpec{Cassandra: &api.CassandraClusterTemplate{LegacyCqlCredentialsSecretRef: &corev1.LocalObjectReference{Name: "other-secret"}}}},
+	}
+	testScheme := runtime.NewScheme()
+	require.NoError(t, api.AddToScheme(testScheme))
+	indexedClient := fakeclient.NewClientBuilder().WithScheme(testScheme).
+		WithObjects(&clusters[0], &clusters[1]).
+		WithIndex(&api.K8ssandraCluster{}, legacyRFCQLCredentialsSecretRefIndex, legacyRFCQLCredentialsSecretRefValues).
+		WithIndex(&api.K8ssandraCluster{}, legacyRFCQLTLSSecretRefIndex, legacyRFCQLTLSSecretRefValues).Build()
+	secret := &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: "legacy-cql", Namespace: "control"}}
+	require.Equal(t, []reconcile.Request{{NamespacedName: types.NamespacedName{Namespace: "control", Name: "migration"}}}, legacyRFReferencedSecretRequests(context.Background(), indexedClient, secret))
+	secret.Name = "unrelated"
+	require.Empty(t, legacyRFReferencedSecretRequests(context.Background(), indexedClient, secret))
+	secret.Name = "legacy-tls"
+	require.Equal(t, []reconcile.Request{{NamespacedName: types.NamespacedName{Namespace: "control", Name: "migration"}}}, legacyRFReferencedSecretRequests(context.Background(), indexedClient, secret))
+
+	secret.Name = "legacy-cql"
+	require.Equal(t, []reconcile.Request{{NamespacedName: types.NamespacedName{Namespace: "control", Name: "migration"}}}, legacyRFReferencedSecretRequests(context.Background(), &failingLegacyRFIndexReader{
+		Reader: indexedClient, failSelector: legacyRFCQLTLSSecretRefIndex + "=" + secret.Name,
+	}, secret), "credential lookup results survive a TLS index error")
+	secret.Name = "legacy-tls"
+	require.Equal(t, []reconcile.Request{{NamespacedName: types.NamespacedName{Namespace: "control", Name: "migration"}}}, legacyRFReferencedSecretRequests(context.Background(), &failingLegacyRFIndexReader{
+		Reader: indexedClient, failSelector: legacyRFCQLCredentialsSecretRefIndex + "=" + secret.Name,
+	}, secret), "TLS lookup results survive a credential index error")
+}
+
+type failingLegacyRFIndexReader struct {
+	client.Reader
+	failSelector string
+}
+
+func (reader *failingLegacyRFIndexReader) List(ctx context.Context, list client.ObjectList, options ...client.ListOption) error {
+	listOptions := &client.ListOptions{}
+	listOptions.ApplyOptions(options)
+	if listOptions.FieldSelector != nil && listOptions.FieldSelector.String() == reader.failSelector {
+		return stderrors.New("injected index lookup failure")
+	}
+	return reader.Reader.List(ctx, list, options...)
+}
+
+func TestLegacyRFAcceptedSeedsIgnoreLaterSpecEdits(t *testing.T) {
+	snapshot := &api.LegacyRFSnapshot{AcceptedSeeds: []string{"192.0.2.10", "2001:db8::10"}}
+	hash, err := LegacyRFSnapshotHash(snapshot)
+	require.NoError(t, err)
+	snapshot.Hash = hash
+	cluster := &api.K8ssandraCluster{
+		ObjectMeta: metav1.ObjectMeta{Annotations: map[string]string{api.LegacyRFDiscoveryMarkerAnnotation: api.LegacyRFDiscoveryMarkerVersion}},
+		Spec: api.K8ssandraClusterSpec{Cassandra: &api.CassandraClusterTemplate{
+			AdditionalSeeds: []string{"198.51.100.9"},
+		}},
+		Status: api.K8ssandraClusterStatus{LegacyRFDiscovery: &api.LegacyRFDiscoveryStatus{
+			Phase: api.LegacyRFDiscoveryPhaseAccepted, SnapshotHash: snapshot.Hash, AcceptedSnapshot: snapshot,
+		}},
+	}
+
+	seeds, err := acceptedLegacyRFSeeds(cluster, []string{"198.51.100.9"})
+
+	require.NoError(t, err)
+	require.Equal(t, []string{"192.0.2.10", "2001:db8::10"}, seeds)
+	seeds[0] = "changed"
+	require.Equal(t, "192.0.2.10", cluster.Status.LegacyRFDiscovery.AcceptedSnapshot.AcceptedSeeds[0])
+}
+
+func TestLegacyRFMarkerAloneDoesNotReplaceOrdinaryAdditionalSeeds(t *testing.T) {
+	cluster := &api.K8ssandraCluster{
+		ObjectMeta: metav1.ObjectMeta{Annotations: map[string]string{
+			api.LegacyRFDiscoveryMarkerAnnotation: api.LegacyRFDiscoveryMarkerVersion,
+		}},
+		Spec: api.K8ssandraClusterSpec{Cassandra: &api.CassandraClusterTemplate{}},
+	}
+	want := []string{"198.51.100.9"}
+
+	seeds, err := acceptedLegacyRFSeeds(cluster, want)
+
+	require.NoError(t, err)
+	require.Equal(t, want, seeds)
+	seeds[0] = "changed"
+	require.Equal(t, "198.51.100.9", want[0], "ordinary seed configuration must be copied")
+}
+
+func TestLegacyRFControllerIntegrationRejectsNilDependencies(t *testing.T) {
+	integration, err := NewLegacyRFControllerIntegration(nil, nil, nil, nil, nil, nil)
+	require.Error(t, err)
+	require.Nil(t, integration)
+}
+
+func TestLegacyRFControllerAggregateSafetyMatrix(t *testing.T) {
+	t.Log("ENVTEST LIMITATION: deterministic controller boundaries are exercised without a real Cassandra process or worker Pod")
+	t.Run("qualification", func(t *testing.T) {
+		cluster := safetyCluster()
+		require.Equal(t, api.LegacyRFDiscoveryPhasePending, DecideLegacyRFDiscovery(cluster, false, nil).Phase)
+		delete(cluster.Annotations, api.LegacyRFDiscoveryMarkerAnnotation)
+		require.Equal(t, api.LegacyRFDiscoveryPhaseNotRequired, DecideLegacyRFDiscovery(cluster, false, nil).Phase)
+	})
+	t.Run("CAS and restart read-back", func(t *testing.T) {
+		cluster, attempt, discovered, snapshot := acceptanceFixture(t)
+		trace := []string{}
+		control := &traceLegacyRFControl{current: cluster, trace: &trace}
+		outcome, err := AcceptLegacyRFSnapshot(context.Background(), control, &traceManagedState{trace: &trace}, LegacyRFAcceptanceInput{
+			Key: client.ObjectKeyFromObject(cluster), ExpectedUID: cluster.UID,
+			Attempt: attempt, Result: discovered, Snapshot: snapshot, Secrets: &traceLegacyRFSecretState{trace: &trace},
+		})
+		require.NoError(t, err)
+		require.True(t, outcome.Stop)
+		restarted, err := control.Read(context.Background(), client.ObjectKeyFromObject(cluster))
+		require.NoError(t, err)
+		require.Equal(t, snapshot.Hash, restarted.Status.LegacyRFDiscovery.SnapshotHash)
+		require.Equal(t, []string{"read", "survey:plane-a/data/dc-a", "secrets", "patch", "read"}, trace)
+	})
+	t.Run("current and historical surveys survive restart", func(t *testing.T) {
+		cluster, _, _, snapshot := acceptanceFixture(t)
+		cluster.Status.LegacyRFDiscovery = acceptedStatus(snapshot)
+		cluster.Status.LegacyRFDiscovery.ManagedLocationHistory = []api.LegacyRFManagedLocation{{K8sContext: "old", Namespace: "data", Name: "removed"}}
+		cluster.Spec.Cassandra.Datacenters = append(cluster.Spec.Cassandra.Datacenters, api.CassandraDatacenterTemplate{
+			Meta: api.EmbeddedObjectMeta{Name: "dc-b", Namespace: "data"}, K8sContext: "plane-b",
+		})
+		trace := []string{}
+		target := api.LegacyRFManagedLocation{K8sContext: "plane-b", Namespace: "data", Name: "dc-b", DatacenterName: "dc-b"}
+		err := AuthorizeLegacyRFManagedCreation(context.Background(), &traceLegacyRFControl{current: cluster, trace: &trace}, &traceManagedState{trace: &trace}, LegacyRFManagedCreationInput{
+			Key: client.ObjectKeyFromObject(cluster), ExpectedUID: cluster.UID, ExpectedSnapshotHash: snapshot.Hash, Target: target,
+			Create: func(context.Context, []string) error { trace = append(trace, "create"); return nil },
+		})
+		require.NoError(t, err)
+		require.Contains(t, trace, "survey:plane-a/data/dc-a")
+		require.Contains(t, trace, "survey:plane-b/data/dc-b")
+		require.Contains(t, trace, "survey:old/data/removed")
+		require.Equal(t, "create", trace[len(trace)-1])
+	})
+	t.Run("accepted snapshot loss blocks without rediscovery", func(t *testing.T) {
+		cluster := safetyCluster()
+		historical := api.LegacyRFManagedLocation{K8sContext: "old", Namespace: "data", Name: "removed"}
+		cluster.Status.LegacyRFDiscovery = &api.LegacyRFDiscoveryStatus{Phase: api.LegacyRFDiscoveryPhaseAccepted, SnapshotHash: "lost", ManagedLocationHistory: []api.LegacyRFManagedLocation{historical}}
+		decision := DecideLegacyRFDiscovery(cluster, false, nil)
+		require.Equal(t, api.LegacyRFDiscoveryPhaseBlocked, decision.Phase)
+		require.Equal(t, api.LegacyRFReasonSnapshotConflict, decision.Reason)
+		require.Empty(t, decision.AttemptLocations)
+	})
+	t.Run("result watches are exact", func(t *testing.T) {
+		cluster := *safetyCluster()
+		request := reconcile.Request{NamespacedName: client.ObjectKeyFromObject(&cluster)}
+		resultObject := &corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Namespace: "data", Name: "result", Labels: labels.WatchedByK8ssandraClusterLabels(request.NamespacedName)}}
+		require.Equal(t, []reconcile.Request{request}, legacyRFOwnerRequests(resultObject))
+		resultObject.Labels[api.K8ssandraClusterNameLabel] = "other"
+		require.NotEqual(t, []reconcile.Request{request}, legacyRFOwnerRequests(resultObject))
+	})
+	t.Run("generation binding and plan races reject before patch", func(t *testing.T) {
+		mutations := map[string]func(*api.K8ssandraCluster, *discovery.Attempt){
+			"generation": func(cluster *api.K8ssandraCluster, _ *discovery.Attempt) { cluster.Generation++ },
+			"Secret binding": func(_ *api.K8ssandraCluster, attempt *discovery.Attempt) {
+				attempt.Connection.SecretBindings[0].ResourceVersion = "changed"
+			},
+			"plan": func(cluster *api.K8ssandraCluster, _ *discovery.Attempt) {
+				cluster.Spec.Cassandra.Datacenters[0].Meta.Name = "renamed"
+			},
+		}
+		for name, mutate := range mutations {
+			t.Run(name, func(t *testing.T) {
+				cluster, attempt, discovered, snapshot := acceptanceFixture(t)
+				mutate(cluster, &attempt)
+				trace := []string{}
+				_, err := AcceptLegacyRFSnapshot(context.Background(), &traceLegacyRFControl{current: cluster, trace: &trace}, &traceManagedState{trace: &trace}, LegacyRFAcceptanceInput{
+					Key: client.ObjectKeyFromObject(cluster), ExpectedUID: cluster.UID, Attempt: attempt, Result: discovered, Snapshot: snapshot, Secrets: &traceLegacyRFSecretState{trace: &trace},
+				})
+				require.Error(t, err)
+				require.NotContains(t, trace, "patch")
+			})
+		}
+	})
+	t.Run("errors and events are redacted", func(t *testing.T) {
+		cluster := safetyCluster()
+		decision := DecideLegacyRFDiscovery(cluster, false, discovery.NewBoundaryError(api.LegacyRFReasonAuthenticationRejected, stderrors.New("password=canary")))
+		require.NotContains(t, decision.Message, "canary")
+		recorder := record.NewFakeRecorder(1)
+		ApplyLegacyRFDiscoveryDecision(cluster, decision, metav1.Now(), recorder)
+		require.NotContains(t, <-recorder.Events, "canary")
+	})
+}
 
 const (
 	timeout  = time.Second * 5

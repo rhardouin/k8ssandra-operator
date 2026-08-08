@@ -10,6 +10,28 @@ metadata:
   labels: {{ include "k8ssandra-common.labels" . | indent 4 }}
   name: {{ include "k8ssandra-common.fullname" . }}-mutating-webhook-configuration
 webhooks:
+{{- if .Values.controlPlane }}
+- admissionReviewVersions:
+  - v1
+  clientConfig:
+    service:
+      name: {{ include "k8ssandra-common.fullname" . }}-webhook-service
+      namespace: {{ .Release.Namespace }}
+      path: /mutate-k8ssandra-io-v1alpha1-k8ssandracluster
+  failurePolicy: Fail
+  name: mk8ssandracluster.kb.io
+  rules:
+  - apiGroups:
+    - k8ssandra.io
+    apiVersions:
+    - v1alpha1
+    operations:
+    - CREATE
+    - UPDATE
+    resources:
+    - k8ssandraclusters
+  sideEffects: None
+{{- end }}
 - admissionReviewVersions:
   - v1
   clientConfig:
@@ -22,6 +44,11 @@ webhooks:
   objectSelector:
     matchLabels:
       app.kubernetes.io/created-by: cass-operator
+    matchExpressions:
+    - key: control-plane
+      operator: NotIn
+      values:
+      - k8ssandra-operator
   rules:
   - apiGroups:
     - ""

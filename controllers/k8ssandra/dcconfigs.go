@@ -25,6 +25,7 @@ func (r *K8ssandraClusterReconciler) createDatacenterConfigs(
 ) ([]*cassandra.DatacenterConfig, error) {
 	kcKey := utils.GetKey(kc)
 	var dcConfigs []*cassandra.DatacenterConfig
+	legacyRFValidated := DecideLegacyRFDiscovery(kc, false, nil).Phase == api.LegacyRFDiscoveryPhaseAccepted
 
 	for _, dcTemplate := range kc.Spec.Cassandra.Datacenters {
 		dcConfig := cassandra.Coalesce(kc.CassClusterName(), kc.Spec.Cassandra.DeepCopy(), dcTemplate.DeepCopy())
@@ -58,7 +59,8 @@ func (r *K8ssandraClusterReconciler) createDatacenterConfigs(
 		// which is why we're doing this for Cassandra only.
 		// We only set this for the first DC. For subsequent DCs, the replication will be altered and a rebuild
 		// triggered.
-		if kc.Spec.Cassandra.ServerType.IsCassandra() && len(dcConfigs) == 0 {
+		if kc.Spec.Cassandra.ServerType.IsCassandra() && len(dcConfigs) == 0 &&
+			!legacyRFDiscoveryQualifies(kc) {
 			cassandra.ApplySystemReplication(dcConfig, systemReplication)
 		}
 
@@ -99,7 +101,7 @@ func (r *K8ssandraClusterReconciler) createDatacenterConfigs(
 		// If the user has specified external datacenters, we should skip user creation
 		// otherwise cass-operator will attempt to create users although the replication of system_auth
 		// hasn't been updated to include the new DC.
-		if len(kc.Spec.ExternalDatacenters) > 0 {
+		if len(kc.Spec.ExternalDatacenters) > 0 && (!kc.Spec.IsAuthEnabled() || !legacyRFValidated) {
 			dcConfig.Meta.Annotations = map[string]string{
 				"cassandra.datastax.com/skip-user-creation": "true",
 			}

@@ -3,6 +3,7 @@ package test
 import (
 	"context"
 	"fmt"
+	"sync"
 	"testing"
 
 	"github.com/go-logr/logr"
@@ -43,20 +44,27 @@ var defaultAdapter ManagementApiFactoryAdapter = func(
 }
 
 type FakeManagementApiFactory struct {
-	t *testing.T
+	mutex sync.RWMutex
+	t     *testing.T
 
 	adapter ManagementApiFactoryAdapter
 }
 
 func (f *FakeManagementApiFactory) SetT(t *testing.T) {
+	f.mutex.Lock()
+	defer f.mutex.Unlock()
 	f.t = t
 }
 
 func (f *FakeManagementApiFactory) UseDefaultAdapter() {
+	f.mutex.Lock()
+	defer f.mutex.Unlock()
 	f.adapter = defaultAdapter
 }
 
 func (f *FakeManagementApiFactory) SetAdapter(a ManagementApiFactoryAdapter) {
+	f.mutex.Lock()
+	defer f.mutex.Unlock()
 	f.adapter = a
 }
 
@@ -65,24 +73,29 @@ func (f *FakeManagementApiFactory) NewManagementApiFacade(
 	dc *cassdcapi.CassandraDatacenter,
 	client client.Client,
 	logger logr.Logger) (cassandra.ManagementApiFacade, error) {
-	if f.t == nil {
+	f.mutex.RLock()
+	t := f.t
+	adapter := f.adapter
+	f.mutex.RUnlock()
+
+	if t == nil {
 		return nil, fmt.Errorf("testing.T instance not set")
 	}
 
-	if f.adapter == nil {
+	if adapter == nil {
 		return nil, fmt.Errorf("adapter not set")
 	}
 
 	var mgmtApi cassandra.ManagementApiFacade
 	var err error
 
-	mgmtApi, err = f.adapter(ctx, dc, client, logger)
+	mgmtApi, err = adapter(ctx, dc, client, logger)
 	if err != nil {
 		return nil, err
 	}
 
 	if testable, ok := mgmtApi.(Testable); ok {
-		testable.Test(f.t)
+		testable.Test(t)
 	}
 
 	return mgmtApi, nil
@@ -103,6 +116,9 @@ const (
 
 type FakeManagementApiFacade struct {
 	*mocks.ManagementApiFacade
+
+	callsMutex    sync.RWMutex
+	recordedCalls []mock.Call
 }
 
 type Testable interface {
@@ -114,11 +130,26 @@ func NewFakeManagementApiFacade() *FakeManagementApiFacade {
 	return &FakeManagementApiFacade{ManagementApiFacade: m}
 }
 
+// EnsureKeyspaceReplication records completed calls in a race-safe log used by
+// controller tests that assert call ordering while reconciliation is active.
+func (f *FakeManagementApiFacade) EnsureKeyspaceReplication(keyspaceName string, replication map[string]int) error {
+	err := f.ManagementApiFacade.EnsureKeyspaceReplication(keyspaceName, replication)
+	f.callsMutex.Lock()
+	defer f.callsMutex.Unlock()
+	f.recordedCalls = append(f.recordedCalls, mock.Call{
+		Method:    string(EnsureKeyspaceReplication),
+		Arguments: mock.Arguments{keyspaceName, replication},
+	})
+	return err
+}
+
 func (f *FakeManagementApiFacade) GetLastCall(method ManagementApiMethod, args ...interface{}) int {
+	f.callsMutex.RLock()
+	defer f.callsMutex.RUnlock()
 	idx := -1
 
 	calls := make([]mock.Call, 0)
-	for _, call := range f.Calls {
+	for _, call := range f.recordedCalls {
 		if call.Method == string(method) {
 			calls = append(calls, call)
 		}
@@ -134,8 +165,10 @@ func (f *FakeManagementApiFacade) GetLastCall(method ManagementApiMethod, args .
 }
 
 func (f *FakeManagementApiFacade) GetFirstCall(method ManagementApiMethod, args ...interface{}) int {
+	f.callsMutex.RLock()
+	defer f.callsMutex.RUnlock()
 	calls := make([]mock.Call, 0)
-	for _, call := range f.Calls {
+	for _, call := range f.recordedCalls {
 		if call.Method == string(method) {
 			calls = append(calls, call)
 		}

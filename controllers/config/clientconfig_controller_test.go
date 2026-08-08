@@ -2,6 +2,8 @@ package config
 
 import (
 	"context"
+	"errors"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -15,6 +17,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/client-go/rest"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/cluster"
 	"sigs.k8s.io/controller-runtime/pkg/envtest"
@@ -32,7 +35,7 @@ var (
 	testEnv     *testutils.MultiClusterTestEnv
 	scheme      *runtime.Scheme
 	logger      logr.Logger
-	cancelCalls int
+	cancelCalls atomic.Int64
 	// secretFilter map[types.NamespacedName]types.NamespacedName
 	reconciler *ClientConfigReconciler
 	usedMgr    manager.Manager
@@ -43,10 +46,10 @@ func TestClientConfigReconciler(t *testing.T) {
 	ctx := testutils.TestSetup(t)
 	ctx, cancel := context.WithCancel(ctx)
 	testEnv = &testutils.MultiClusterTestEnv{}
-	cancelCalls = 0
+	cancelCalls.Store(0)
 	shutDownFunc := func() {
 		// We don't want to actually call the shutdown in these tests - we just want to know the cancel function was called
-		cancelCalls++
+		cancelCalls.Add(1)
 	}
 	// secretFilter = make(map[types.NamespacedName]types.NamespacedName)
 	reconciler = &ClientConfigReconciler{}
@@ -81,6 +84,8 @@ func TestClientConfigReconciler(t *testing.T) {
 
 	// Secret controller tests
 	t.Run("InitClientConfigs", testEnv.ControllerTest(ctx, testInitClientConfigs))
+	t.Run("DirectClientConstructionFailure", testEnv.ControllerTest(ctx, testDirectClientConstructionFailure))
+	t.Run("ManagerRegistrationFailure", testEnv.ControllerTest(ctx, testManagerRegistrationFailure))
 	t.Run("SecretModification", testEnv.ControllerTest(ctx, testSecretModification))
 	t.Run("ClientConfigDeletion", testEnv.ControllerTest(ctx, testConfigDeletion))
 	t.Run("SecretDeletion", testEnv.ControllerTest(ctx, testSecretDeletion))
@@ -132,6 +137,11 @@ func testInitClientConfigs(t *testing.T, ctx context.Context, f *framework.Frame
 	clusters, err := reconciler.InitClientConfigs(ctx, usedMgr, namespace)
 	assert.NoError(err)
 	assert.Equal(1, len(clusters))
+	cachedClient, err := reconciler.ClientCache.GetRemoteClient("envtest")
+	assert.NoError(err)
+	directClient, err := reconciler.ClientCache.GetRemoteNonCacheClient("envtest")
+	assert.NoError(err, "InitClientConfigs must register a direct client for fail-closed API reads")
+	assert.NotSame(cachedClient, directClient, "cached and direct clients must be distinct instances")
 
 	secretKey := types.NamespacedName{Namespace: namespace, Name: secret.Name}
 	clientConfigKey := types.NamespacedName{Namespace: namespace, Name: clientConfig.Name}
@@ -144,7 +154,9 @@ func testInitClientConfigs(t *testing.T, ctx context.Context, f *framework.Frame
 			return false
 		}
 
+		reconciler.filterMutex.RLock()
 		_, found := reconciler.secretFilter[secretKey]
+		reconciler.filterMutex.RUnlock()
 		return metav1.HasAnnotation(currentConfig.ObjectMeta, KubeSecretHashAnnotation) &&
 			metav1.HasAnnotation(currentConfig.ObjectMeta, ClientConfigHashAnnotation) &&
 			found
@@ -158,12 +170,83 @@ func testInitClientConfigs(t *testing.T, ctx context.Context, f *framework.Frame
 	assert.Error(err)
 }
 
+func testDirectClientConstructionFailure(t *testing.T, ctx context.Context, f *framework.Framework, namespace string) {
+	localCache, err := clientcache.NewValidated(
+		reconciler.ClientCache.GetLocalClient(),
+		reconciler.ClientCache.GetLocalNonCacheClient(),
+		scheme,
+	)
+	assert.NoError(t, err)
+
+	secret, err := insertKubeConfigSecret(ctx, f.Client, namespace)
+	assert.NoError(t, err)
+	clientConfig, err := insertClientConfig(ctx, f.Client, namespace, "envtest", secret.Name)
+	assert.NoError(t, err)
+
+	testReconciler := &ClientConfigReconciler{
+		ClientCache:  localCache,
+		Scheme:       scheme,
+		secretFilter: make(map[types.NamespacedName]types.NamespacedName),
+		newDirectClient: func(*rest.Config, client.Options) (client.Client, error) {
+			return nil, errors.New("injected construction failure")
+		},
+	}
+
+	_, err = testReconciler.initAdditionalClusterConfig(ctx, *clientConfig, usedMgr, nil)
+	assert.ErrorContains(t, err, `create direct client for context "envtest": injected construction failure`)
+	_, cachedErr := localCache.GetRemoteClient("envtest")
+	assert.Error(t, cachedErr, "failed construction must not leave a cached registration")
+	_, directErr := localCache.GetRemoteNonCacheClient("envtest")
+	assert.Error(t, directErr, "failed construction must not leave a direct registration")
+}
+
+type managerWithAddError struct {
+	manager.Manager
+}
+
+func (managerWithAddError) Add(manager.Runnable) error {
+	return errors.New("injected manager registration failure")
+}
+
+func testManagerRegistrationFailure(t *testing.T, ctx context.Context, f *framework.Framework, namespace string) {
+	localCache, err := clientcache.NewValidated(
+		reconciler.ClientCache.GetLocalClient(),
+		reconciler.ClientCache.GetLocalNonCacheClient(),
+		scheme,
+	)
+	assert.NoError(t, err)
+
+	secret, err := insertKubeConfigSecret(ctx, f.Client, namespace)
+	assert.NoError(t, err)
+	clientConfig, err := insertClientConfig(ctx, f.Client, namespace, "envtest", secret.Name)
+	assert.NoError(t, err)
+
+	testReconciler := &ClientConfigReconciler{
+		ClientCache:  localCache,
+		Scheme:       scheme,
+		secretFilter: make(map[types.NamespacedName]types.NamespacedName),
+	}
+	_, err = testReconciler.initAdditionalClusterConfig(
+		ctx,
+		*clientConfig,
+		managerWithAddError{Manager: usedMgr},
+		nil,
+	)
+	assert.ErrorContains(t, err, `register cached cluster for context "envtest": injected manager registration failure`)
+	_, cachedErr := localCache.GetRemoteClient("envtest")
+	assert.Error(t, cachedErr, "failed manager registration must not leave a cached registration")
+	_, directErr := localCache.GetRemoteNonCacheClient("envtest")
+	assert.Error(t, directErr, "failed manager registration must not leave a direct registration")
+}
+
 func testSecretModification(t *testing.T, ctx context.Context, f *framework.Framework, namespace string) {
 	// Intentionally different from previous test. This wants to test the internal behavior more, without
 	// relying on the controller itself creating "necessary" requirements
 
 	assert := assert.New(t)
+	reconciler.filterMutex.Lock()
 	reconciler.secretFilter = make(map[types.NamespacedName]types.NamespacedName)
+	reconciler.filterMutex.Unlock()
 
 	secret, err := insertKubeConfigSecret(ctx, f.Client, namespace)
 	assert.NoError(err)
@@ -190,10 +273,12 @@ func testSecretModification(t *testing.T, ctx context.Context, f *framework.Fram
 	// Now update the secretFilter
 	secretKey := types.NamespacedName{Namespace: namespace, Name: secret.Name}
 	clientConfigKey := types.NamespacedName{Namespace: namespace, Name: clientConfig.Name}
+	reconciler.filterMutex.Lock()
 	reconciler.secretFilter[secretKey] = clientConfigKey
+	reconciler.filterMutex.Unlock()
 
 	// Store currentCount of cancelFunc
-	currentCount := cancelCalls
+	currentCount := cancelCalls.Load()
 
 	secretCurrent := &corev1.Secret{}
 	err = f.Client.Get(ctx, secretKey, secretCurrent)
@@ -204,7 +289,7 @@ func testSecretModification(t *testing.T, ctx context.Context, f *framework.Fram
 	assert.NoError(err)
 
 	assert.Eventually(func() bool {
-		return cancelCalls > currentCount
+		return cancelCalls.Load() > currentCount
 	}, timeout, interval)
 }
 
@@ -222,14 +307,14 @@ func testConfigDeletion(t *testing.T, ctx context.Context, f *framework.Framewor
 	assert.NoError(err)
 
 	// Store currentCount of cancelFunc
-	currentCount := cancelCalls
+	currentCount := cancelCalls.Load()
 
 	t.Log("Delete ClientConfig and wait for shutdown call")
 	err = f.Client.Delete(ctx, clientConfig)
 	assert.NoError(err)
 
 	assert.Eventually(func() bool {
-		return cancelCalls > currentCount
+		return cancelCalls.Load() > currentCount
 	}, timeout, interval)
 }
 
@@ -247,13 +332,13 @@ func testSecretDeletion(t *testing.T, ctx context.Context, f *framework.Framewor
 	assert.NoError(err)
 
 	// Store currentCount of cancelFunc
-	currentCount := cancelCalls
+	currentCount := cancelCalls.Load()
 
 	t.Log("Delete Secret and wait for shutdown call")
 	err = f.Client.Delete(ctx, secret)
 	assert.NoError(err)
 
 	assert.Eventually(func() bool {
-		return cancelCalls > currentCount
+		return cancelCalls.Load() > currentCount
 	}, timeout, interval)
 }

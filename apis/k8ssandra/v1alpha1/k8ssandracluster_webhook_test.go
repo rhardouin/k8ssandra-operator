@@ -21,6 +21,7 @@ import (
 	"crypto/tls"
 	"fmt"
 	"net"
+	"net/url"
 	"path/filepath"
 	"testing"
 	"time"
@@ -34,6 +35,10 @@ import (
 	"github.com/sirupsen/logrus"
 	"github.com/stretchr/testify/require"
 	admissionv1 "k8s.io/api/admission/v1"
+	admissionregistrationv1 "k8s.io/api/admissionregistration/v1"
+	apiextensionsv1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/labels"
 	"sigs.k8s.io/controller-runtime/pkg/metrics/server"
 	"sigs.k8s.io/controller-runtime/pkg/webhook"
 
@@ -72,7 +77,7 @@ var minimalInMemoryReaperConfig = &reaperapi.ReaperClusterTemplate{
 	},
 }
 
-func TestWebhook(t *testing.T) {
+func TestK8ssandraClusterWebhook(t *testing.T) {
 	required := require.New(t)
 	ctx, cancel = context.WithCancel(context.TODO())
 
@@ -109,6 +114,10 @@ func TestWebhook(t *testing.T) {
 
 	err = admissionv1.AddToScheme(scheme)
 	required.NoError(err)
+	err = admissionregistrationv1.AddToScheme(scheme)
+	required.NoError(err)
+	err = apiextensionsv1.AddToScheme(scheme)
+	required.NoError(err)
 
 	err = AddToScheme(scheme)
 	required.NoError(err)
@@ -121,6 +130,8 @@ func TestWebhook(t *testing.T) {
 	k8sClient, err = client.New(cfg, client.Options{Scheme: scheme})
 	required.NoError(err)
 	required.NotNil(k8sClient)
+	required.NoError(enableLegacyRFSecretReferenceFields(k8sClient))
+	required.NoError(removeGeneratedMutatingWebhook(k8sClient))
 
 	// start webhook server using Manager
 	webhookInstallOptions := &testEnv.WebhookInstallOptions
@@ -168,6 +179,19 @@ func TestWebhook(t *testing.T) {
 		return true
 	}, 2*time.Second, 300*time.Millisecond)
 
+	legacyCluster := createLegacyUnmarkedCluster(required)
+	required.NoError(installLegacyRFMutatingWebhooks(k8sClient, webhookInstallOptions))
+
+	t.Run("LegacyRFCreateInjection", testLegacyRFCreateInjection)
+	t.Run("LegacyRFForgedMarker", testLegacyRFForgedMarker)
+	t.Run("LegacyRFMarkerImmutability", testLegacyRFMarkerImmutability)
+	t.Run("LegacyRFNoUpdateInjection", func(t *testing.T) {
+		testLegacyRFNoUpdateInjection(t, legacyCluster)
+	})
+	t.Run("LegacyRFLocalValidation", testLegacyRFLocalValidation)
+	t.Run("LegacyRFAdmissionUnavailable", testLegacyRFAdmissionUnavailable)
+	t.Run("LegacyRFNoSeedCompatibility", testLegacyRFNoSeedCompatibility)
+
 	t.Run("ContextValidation", testContextValidation)
 	t.Run("ReaperKeyspaceValidation", testReaperKeyspaceValidation)
 	t.Run("StorageConfigValidation", testStorageConfigValidation)
@@ -182,6 +206,283 @@ func TestWebhook(t *testing.T) {
 	t.Run("ReaperStorage", testReaperStorage)
 	t.Run("NoDCRename", testNoDCRename)
 	t.Run("MedusaMandatoryFieldsMissing", testMedusaMandatoryFieldsMissing)
+}
+
+func TestValidateLegacyRFDiscoveryEnforcesSeedLimit(t *testing.T) {
+	cluster := &K8ssandraCluster{Spec: K8ssandraClusterSpec{Cassandra: &CassandraClusterTemplate{}}}
+	seeds := make([]string, 33)
+	for index := range seeds {
+		seeds[index] = fmt.Sprintf("192.0.2.%d", index+1)
+	}
+
+	cluster.Spec.Cassandra.AdditionalSeeds = seeds[:32]
+	require.NoError(t, validateLegacyRFDiscovery(cluster))
+
+	cluster.Spec.Cassandra.AdditionalSeeds = seeds
+	require.ErrorContains(t, validateLegacyRFDiscovery(cluster), "at most 32")
+}
+
+func removeGeneratedMutatingWebhook(kubeClient client.Client) error {
+	configuration := &admissionregistrationv1.MutatingWebhookConfiguration{}
+	key := client.ObjectKey{Name: "mutating-webhook-configuration"}
+	if err := kubeClient.Get(ctx, key, configuration); err != nil {
+		return fmt.Errorf("get generated mutating webhook: %w", err)
+	}
+	if err := kubeClient.Delete(ctx, configuration); err != nil {
+		return fmt.Errorf("delete generated mutating webhook: %w", err)
+	}
+	return nil
+}
+
+func enableLegacyRFSecretReferenceFields(kubeClient client.Client) error {
+	crd := &apiextensionsv1.CustomResourceDefinition{}
+	if err := kubeClient.Get(ctx, client.ObjectKey{Name: "k8ssandraclusters.k8ssandra.io"}, crd); err != nil {
+		return fmt.Errorf("get K8ssandraCluster CRD: %w", err)
+	}
+	for index := range crd.Spec.Versions {
+		if crd.Spec.Versions[index].Name != GroupVersion.Version {
+			continue
+		}
+		schema := crd.Spec.Versions[index].Schema.OpenAPIV3Schema
+		specSchema := schema.Properties["spec"]
+		cassandraSchema := specSchema.Properties["cassandra"]
+		cassandraSchema.Properties["legacyCqlCredentialsSecretRef"] = apiextensionsv1.JSONSchemaProps{
+			Type: "object",
+			Properties: map[string]apiextensionsv1.JSONSchemaProps{
+				"name": {Type: "string"},
+			},
+		}
+		cassandraSchema.Properties["legacyCqlTLSSecretRef"] = apiextensionsv1.JSONSchemaProps{
+			Type: "object",
+			Properties: map[string]apiextensionsv1.JSONSchemaProps{
+				"name": {Type: "string"},
+			},
+		}
+		specSchema.Properties["cassandra"] = cassandraSchema
+		schema.Properties["spec"] = specSchema
+		break
+	}
+	if err := kubeClient.Update(ctx, crd); err != nil {
+		return fmt.Errorf("update K8ssandraCluster CRD test schema: %w", err)
+	}
+	return nil
+}
+
+func createLegacyUnmarkedCluster(required *require.Assertions) *K8ssandraCluster {
+	createNamespace(required, "legacy-unmarked")
+	cluster := createMinimalClusterObj("legacy-unmarked", "legacy-unmarked")
+	cluster.Spec.Cassandra.ServerVersion = "4.1.8"
+	required.NoError(k8sClient.Create(ctx, cluster))
+	required.NotContains(cluster.Annotations, LegacyRFDiscoveryMarkerAnnotation)
+	return cluster
+}
+
+func installLegacyRFMutatingWebhooks(kubeClient client.Client, options *envtest.WebhookInstallOptions) error {
+	webhookURL := url.URL{
+		Scheme: "https",
+		Host:   net.JoinHostPort(options.LocalServingHost, fmt.Sprintf("%d", options.LocalServingPort)),
+		Path:   "/mutate-k8ssandra-io-v1alpha1-k8ssandracluster",
+	}
+	configurations := []*admissionregistrationv1.MutatingWebhookConfiguration{
+		legacyRFMutatingWebhook("legacy-rf-admission", webhookURL.String(), options.LocalServingCAData, nil),
+		legacyRFMutatingWebhook("legacy-rf-admission-outage", "https://127.0.0.1:1/unavailable", nil,
+			&metav1.LabelSelector{MatchLabels: map[string]string{"legacy-rf-admission": "outage"}}),
+	}
+	for _, configuration := range configurations {
+		if err := kubeClient.Create(ctx, configuration); err != nil {
+			return fmt.Errorf("install %s: %w", configuration.Name, err)
+		}
+	}
+	return nil
+}
+
+func legacyRFMutatingWebhook(
+	name string,
+	webhookURL string,
+	caBundle []byte,
+	namespaceSelector *metav1.LabelSelector,
+) *admissionregistrationv1.MutatingWebhookConfiguration {
+	failurePolicy := admissionregistrationv1.Fail
+	sideEffects := admissionregistrationv1.SideEffectClassNone
+	timeoutSeconds := int32(2)
+	return &admissionregistrationv1.MutatingWebhookConfiguration{
+		ObjectMeta: metav1.ObjectMeta{Name: name},
+		Webhooks: []admissionregistrationv1.MutatingWebhook{{
+			Name:                    name + ".k8ssandra.io",
+			AdmissionReviewVersions: []string{"v1"},
+			FailurePolicy:           &failurePolicy,
+			SideEffects:             &sideEffects,
+			TimeoutSeconds:          &timeoutSeconds,
+			NamespaceSelector:       namespaceSelector,
+			ClientConfig: admissionregistrationv1.WebhookClientConfig{
+				URL:      &webhookURL,
+				CABundle: caBundle,
+			},
+			Rules: []admissionregistrationv1.RuleWithOperations{{
+				Operations: []admissionregistrationv1.OperationType{
+					admissionregistrationv1.Create, admissionregistrationv1.Update,
+				},
+				Rule: admissionregistrationv1.Rule{
+					APIGroups:   []string{GroupVersion.Group},
+					APIVersions: []string{GroupVersion.Version},
+					Resources:   []string{"k8ssandraclusters"},
+				},
+			}},
+		}},
+	}
+}
+
+func testLegacyRFCreateInjection(t *testing.T) {
+	required := require.New(t)
+	createNamespace(required, "legacy-rf-create")
+	cluster := createMinimalClusterObj("legacy-rf-create", "legacy-rf-create")
+	cluster.Spec.Cassandra.AdditionalSeeds = []string{"192.0.2.10"}
+	required.NoError(k8sClient.Create(ctx, cluster))
+	required.Equal(LegacyRFDiscoveryMarkerVersion, cluster.Annotations[LegacyRFDiscoveryMarkerAnnotation])
+}
+
+func testLegacyRFForgedMarker(t *testing.T) {
+	required := require.New(t)
+	createNamespace(required, "legacy-rf-forged")
+	cluster := createMinimalClusterObj("legacy-rf-forged", "legacy-rf-forged")
+	cluster.Annotations = map[string]string{LegacyRFDiscoveryMarkerAnnotation: LegacyRFDiscoveryMarkerVersion}
+	err := k8sClient.Create(ctx, cluster)
+	required.Error(err)
+	required.Contains(err.Error(), "reserved discovery marker")
+}
+
+func testLegacyRFMarkerImmutability(t *testing.T) {
+	required := require.New(t)
+	createNamespace(required, "legacy-rf-immutable")
+	cluster := createMinimalClusterObj("legacy-rf-immutable", "legacy-rf-immutable")
+	required.NoError(k8sClient.Create(ctx, cluster))
+
+	delete(cluster.Annotations, LegacyRFDiscoveryMarkerAnnotation)
+	err := k8sClient.Update(ctx, cluster)
+	required.Error(err)
+	required.Contains(err.Error(), "discovery marker is immutable")
+
+	required.NoError(k8sClient.Get(ctx, client.ObjectKeyFromObject(cluster), cluster))
+	cluster.Annotations[LegacyRFDiscoveryMarkerAnnotation] = "forged-version"
+	err = k8sClient.Update(ctx, cluster)
+	required.Error(err)
+	required.Contains(err.Error(), "discovery marker is immutable")
+}
+
+func testLegacyRFNoUpdateInjection(t *testing.T, cluster *K8ssandraCluster) {
+	required := require.New(t)
+	cluster.Labels = labels.Merge(cluster.Labels, map[string]string{"updated": "true"})
+	required.NoError(k8sClient.Update(ctx, cluster))
+	required.NoError(k8sClient.Get(ctx, client.ObjectKeyFromObject(cluster), cluster))
+	required.NotContains(cluster.Annotations, LegacyRFDiscoveryMarkerAnnotation)
+
+	metav1.SetMetaDataAnnotation(&cluster.ObjectMeta, LegacyRFDiscoveryMarkerAnnotation, LegacyRFDiscoveryMarkerVersion)
+	err := k8sClient.Update(ctx, cluster)
+	required.Error(err)
+	required.Contains(err.Error(), "discovery marker is immutable")
+}
+
+func testLegacyRFLocalValidation(t *testing.T) {
+	tests := []struct {
+		name      string
+		configure func(*K8ssandraCluster)
+		wantError string
+	}{
+		{name: "valid Cassandra IPv4", configure: func(cluster *K8ssandraCluster) {
+			cluster.Spec.Cassandra.AdditionalSeeds = []string{"192.0.2.11"}
+		}},
+		{name: "valid Cassandra IPv6", configure: func(cluster *K8ssandraCluster) {
+			cluster.Spec.Cassandra.AdditionalSeeds = []string{"2001:db8::11"}
+		}},
+		{name: "FQDN seed", configure: func(cluster *K8ssandraCluster) {
+			cluster.Spec.Cassandra.AdditionalSeeds = []string{"seed.example.test"}
+		}, wantError: "IP literal"},
+		{name: "seed with port", configure: func(cluster *K8ssandraCluster) {
+			cluster.Spec.Cassandra.AdditionalSeeds = []string{"192.0.2.11:9042"}
+		}, wantError: "IP literal"},
+		{name: "empty credential reference", configure: func(cluster *K8ssandraCluster) {
+			cluster.Spec.Cassandra.AdditionalSeeds = []string{"192.0.2.11"}
+			cluster.Spec.Cassandra.LegacyCqlCredentialsSecretRef = &corev1.LocalObjectReference{}
+		}, wantError: "legacy CQL credential Secret name"},
+		{name: "invalid credential reference", configure: func(cluster *K8ssandraCluster) {
+			cluster.Spec.Cassandra.AdditionalSeeds = []string{"192.0.2.11"}
+			cluster.Spec.Cassandra.LegacyCqlCredentialsSecretRef = &corev1.LocalObjectReference{Name: "Bad_Name"}
+		}, wantError: "legacy CQL credential Secret name"},
+		{name: "valid TLS reference without Secret lookup", configure: func(cluster *K8ssandraCluster) {
+			cluster.Spec.Cassandra.AdditionalSeeds = []string{"192.0.2.11"}
+			cluster.Spec.Cassandra.LegacyCqlTLSSecretRef = &corev1.LocalObjectReference{Name: "legacy-cql-tls"}
+		}},
+		{name: "empty TLS reference", configure: func(cluster *K8ssandraCluster) {
+			cluster.Spec.Cassandra.AdditionalSeeds = []string{"192.0.2.11"}
+			cluster.Spec.Cassandra.LegacyCqlTLSSecretRef = &corev1.LocalObjectReference{}
+		}, wantError: "legacy CQL TLS Secret name"},
+		{name: "invalid TLS reference", configure: func(cluster *K8ssandraCluster) {
+			cluster.Spec.Cassandra.AdditionalSeeds = []string{"192.0.2.11"}
+			cluster.Spec.Cassandra.LegacyCqlTLSSecretRef = &corev1.LocalObjectReference{Name: "Bad_Name"}
+		}, wantError: "legacy CQL TLS Secret name"},
+		{name: "external secrets provider", configure: func(cluster *K8ssandraCluster) {
+			cluster.Spec.Cassandra.AdditionalSeeds = []string{"192.0.2.11"}
+			cluster.Spec.SecretsProvider = "external"
+		}, wantError: "internal Secrets provider"},
+		{name: "DSE server retains existing seed behavior", configure: func(cluster *K8ssandraCluster) {
+			cluster.Spec.Cassandra.AdditionalSeeds = []string{"seed.example.test"}
+			cluster.Spec.Cassandra.ServerType = ServerDistributionDse
+		}},
+		{name: "HCD server retains existing seed behavior", configure: func(cluster *K8ssandraCluster) {
+			cluster.Spec.Cassandra.AdditionalSeeds = []string{"seed.example.test"}
+			cluster.Spec.Cassandra.ServerType = ServerDistributionHcd
+		}},
+	}
+	for index, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			required := require.New(t)
+			namespace := fmt.Sprintf("legacy-rf-local-%d", index)
+			createNamespace(required, namespace)
+			cluster := createMinimalClusterObj(namespace, namespace)
+			test.configure(cluster)
+			err := k8sClient.Create(ctx, cluster)
+			if test.wantError == "" {
+				required.NoError(err)
+				return
+			}
+			required.Error(err)
+			required.Contains(err.Error(), test.wantError)
+		})
+	}
+}
+
+func TestValidateLegacyRFDiscoveryNonCassandraIsNotRejected(t *testing.T) {
+	for _, serverType := range []ServerDistribution{ServerDistributionDse, ServerDistributionHcd} {
+		t.Run(string(serverType), func(t *testing.T) {
+			cluster := createMinimalClusterObj("unsupported", "unsupported")
+			cluster.Spec.Cassandra.ServerType = serverType
+			cluster.Spec.Cassandra.AdditionalSeeds = []string{"seed.example.test"}
+			cluster.Spec.SecretsProvider = "external"
+
+			require.NoError(t, validateLegacyRFDiscovery(cluster))
+		})
+	}
+}
+
+func testLegacyRFAdmissionUnavailable(t *testing.T) {
+	required := require.New(t)
+	namespace := &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{
+		Name: "legacy-rf-outage", Labels: map[string]string{"legacy-rf-admission": "outage"},
+	}}
+	required.NoError(k8sClient.Create(ctx, namespace))
+	cluster := createMinimalClusterObj("legacy-rf-outage", namespace.Name)
+	err := k8sClient.Create(ctx, cluster)
+	required.Error(err)
+	required.True(apierrors.IsInternalError(err) || apierrors.IsServiceUnavailable(err), err.Error())
+}
+
+func testLegacyRFNoSeedCompatibility(t *testing.T) {
+	required := require.New(t)
+	createNamespace(required, "legacy-rf-no-seed")
+	cluster := createMinimalClusterObj("legacy-rf-no-seed", "legacy-rf-no-seed")
+	cluster.Spec.SecretsProvider = "external"
+	required.NoError(k8sClient.Create(ctx, cluster))
+	required.Equal(LegacyRFDiscoveryMarkerVersion, cluster.Annotations[LegacyRFDiscoveryMarkerAnnotation])
 }
 
 func testContextValidation(t *testing.T) {
@@ -289,6 +590,7 @@ func testNumTokens(t *testing.T) {
 
 	// Recreate with tokens
 	cluster.ResourceVersion = ""
+	delete(cluster.Annotations, LegacyRFDiscoveryMarkerAnnotation)
 	err = k8sClient.Create(ctx, cluster)
 	required.NoError(err)
 

@@ -18,10 +18,12 @@ package main
 
 import (
 	"context"
+	cryptorand "crypto/rand"
 	"flag"
 	"fmt"
 	"os"
 	"strings"
+	"time"
 
 	controlcontrollers "github.com/k8ssandra/k8ssandra-operator/controllers/control"
 
@@ -36,6 +38,7 @@ import (
 	"github.com/k8ssandra/k8ssandra-operator/pkg/cassandra"
 	"github.com/k8ssandra/k8ssandra-operator/pkg/clientcache"
 	"github.com/k8ssandra/k8ssandra-operator/pkg/config"
+	"github.com/k8ssandra/k8ssandra-operator/pkg/discovery"
 	"github.com/k8ssandra/k8ssandra-operator/pkg/medusa"
 	"github.com/k8ssandra/k8ssandra-operator/pkg/reaper"
 
@@ -44,8 +47,10 @@ import (
 	_ "k8s.io/client-go/plugin/pkg/client/auth"
 
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/types"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
+	"k8s.io/client-go/tools/events"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/cache"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -107,9 +112,7 @@ func main() {
 	var probeAddr string
 	flag.StringVar(&metricsAddr, "metrics-bind-address", ":8080", "The address the metric endpoint binds to.")
 	flag.StringVar(&probeAddr, "health-probe-bind-address", ":8081", "The address the probe endpoint binds to.")
-	flag.BoolVar(&enableLeaderElection, "leader-elect", false,
-		"Enable leader election for controller manager. "+
-			"Enabling this will ensure there is only one active controller manager.")
+	bindLeaderElectionFlag(flag.CommandLine, &enableLeaderElection)
 	opts := zap.Options{
 		Development: true,
 		TimeEncoder: zapcore.ISO8601TimeEncoder,
@@ -186,7 +189,11 @@ func main() {
 
 	if isControlPlane() {
 		// Fetch ClientConfigs and create the clientCache
-		clientCache := clientcache.New(mgr.GetClient(), uncachedClient, scheme)
+		clientCache, err := clientcache.NewValidated(mgr.GetClient(), uncachedClient, scheme)
+		if err != nil {
+			setupLog.Error(err, "unable to construct client cache")
+			os.Exit(1)
+		}
 
 		configCtrler := &configctrl.ClientConfigReconciler{
 			Scheme:      mgr.GetScheme(),
@@ -204,14 +211,21 @@ func main() {
 			os.Exit(1)
 		}
 
+		legacyRFDiscovery, err := setupLegacyRFDiscovery(uncachedClient, clientCache, mgr.GetEventRecorder("k8ssandracluster-controller"))
+		if err != nil {
+			setupLog.Error(err, "unable to construct legacy RF discovery dependencies")
+			os.Exit(1)
+		}
+
 		if err = (&k8ssandractrl.K8ssandraClusterReconciler{
-			ReconcilerConfig: reconcilerConfig,
-			Client:           mgr.GetClient(),
-			Scheme:           mgr.GetScheme(),
-			ClientCache:      clientCache,
-			ManagementApi:    cassandra.NewManagementApiFactory(),
-			Recorder:         mgr.GetEventRecorder("k8ssandracluster-controller"),
-			ImageRegistry:    registry,
+			ReconcilerConfig:  reconcilerConfig,
+			Client:            mgr.GetClient(),
+			Scheme:            mgr.GetScheme(),
+			ClientCache:       clientCache,
+			ManagementApi:     cassandra.NewManagementApiFactory(),
+			Recorder:          mgr.GetEventRecorder("k8ssandracluster-controller"),
+			ImageRegistry:     registry,
+			LegacyRFDiscovery: legacyRFDiscovery,
 		}).SetupWithManager(ctx, mgr, additionalClusters); err != nil {
 			setupLog.Error(err, "unable to create controller", "controller", "K8ssandraCluster")
 			os.Exit(1)
@@ -333,6 +347,37 @@ func main() {
 		setupLog.Error(err, "problem running manager")
 		os.Exit(1)
 	}
+}
+
+func bindLeaderElectionFlag(flags *flag.FlagSet, target *bool) {
+	flags.BoolVar(target, "leader-elect", false,
+		"Enable leader election for controller manager. "+
+			"Enabling this will ensure there is only one active controller manager.")
+}
+
+type legacyRFStructuredEventRecorder struct {
+	recorder events.EventRecorder
+}
+
+func (r legacyRFStructuredEventRecorder) Event(object runtime.Object, eventType, reason, message string) {
+	r.recorder.Eventf(object, nil, eventType, reason, "LegacyRFDiscovery", "%s", message)
+}
+
+func setupLegacyRFDiscovery(directClient client.Client, clients *clientcache.ClientCache, recorder events.EventRecorder) (k8ssandractrl.LegacyRFControllerIntegration, error) {
+	namespace, err := cassoputils.GetOperatorNamespace()
+	if err != nil {
+		return nil, fmt.Errorf("resolve operator namespace: %w", err)
+	}
+	podName, err := os.Hostname()
+	if err != nil {
+		return nil, fmt.Errorf("resolve manager Pod name: %w", err)
+	}
+	image, err := k8ssandractrl.NewManagerImageResolver(directClient, types.NamespacedName{Namespace: namespace, Name: podName}, "k8ssandra-operator")
+	if err != nil {
+		return nil, err
+	}
+	backoff := k8ssandractrl.NewBoundedDiscoveryBackoff(time.Second, time.Minute, k8ssandractrl.NewDiscoveryJitter(cryptorand.Reader))
+	return k8ssandractrl.NewLegacyRFControllerIntegration(clients, image, discovery.RealClock{}, cryptorand.Reader, legacyRFStructuredEventRecorder{recorder: recorder}, backoff)
 }
 
 func setupImageRegistry(ctx context.Context, uncachedClient client.Client) (cassimages.ImageRegistry, error) {

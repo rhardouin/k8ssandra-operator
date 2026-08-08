@@ -3,6 +3,7 @@ package k8ssandra
 import (
 	"context"
 	"encoding/json"
+	goerrors "errors"
 	"fmt"
 	"strconv"
 	"time"
@@ -19,7 +20,9 @@ import (
 	"github.com/k8ssandra/k8ssandra-operator/pkg/result"
 	"github.com/k8ssandra/k8ssandra-operator/pkg/stargate"
 	"github.com/k8ssandra/k8ssandra-operator/pkg/utils"
+	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 )
 
@@ -116,6 +119,9 @@ func (r *K8ssandraClusterReconciler) checkInitialSystemReplication(
 	ctx context.Context,
 	kc *api.K8ssandraCluster,
 	logger logr.Logger) (cassandra.SystemReplication, error) {
+	if legacyRFDiscoveryQualifies(kc) {
+		return nil, nil
+	}
 	replication := make(map[string]int)
 	if val := annotations.GetAnnotation(kc, api.InitialSystemReplicationAnnotation); val != "" {
 		if err := json.Unmarshal([]byte(val), &replication); err == nil {
@@ -173,6 +179,9 @@ func (r *K8ssandraClusterReconciler) updateReplicationOfSystemKeyspaces(
 	if recResult := r.versionCheck(ctx, kc); recResult.Completed() {
 		return recResult
 	}
+	if legacyRFDiscoveryQualifies(kc) {
+		return r.reconcileAcceptedLegacyRFSchema(kc, mgmtApi, logger)
+	}
 
 	if kc.Spec.Cassandra.ServerType == api.ServerDistributionCassandra {
 		versionString := kc.Spec.Cassandra.ServerVersion
@@ -209,6 +218,105 @@ func (r *K8ssandraClusterReconciler) updateReplicationOfSystemKeyspaces(
 	}
 
 	return result.Continue()
+}
+
+func (r *K8ssandraClusterReconciler) reconcileAcceptedLegacyRFSchema(
+	kc *api.K8ssandraCluster,
+	mgmtAPI legacyRFSchemaManagement,
+	logger logr.Logger,
+) result.ReconcileResult {
+	return r.reconcileAcceptedLegacyRFSchemaWithManaged(kc, mgmtAPI, legacyRFManagedReplication(kc), logger)
+}
+
+func (r *K8ssandraClusterReconciler) reconcileAcceptedLegacyRFSchemaWithManaged(
+	kc *api.K8ssandraCluster,
+	mgmtAPI legacyRFSchemaManagement,
+	managed legacyRFManagedProjection,
+	logger logr.Logger,
+) result.ReconcileResult {
+	snapshot, err := validatedLegacyRFSchemaSnapshot(kc)
+	if err != nil {
+		return result.Error(err)
+	}
+	currentPlan, err := BuildLegacyRFCurrentPlan(kc)
+	if err != nil {
+		return result.Error(err)
+	}
+	if err := ValidateCurrentPlan(snapshot, currentPlan); err != nil {
+		return result.Error(err)
+	}
+	live, err := readLegacyRFSchema(mgmtAPI)
+	if err != nil {
+		return result.Error(err)
+	}
+	plan, err := buildLegacyRFSchemaPlan(snapshot.Replication, live, managed)
+	if err != nil {
+		var drift *legacyRFExternalDriftError
+		if goerrors.As(err, &drift) {
+			r.transitionLegacyRFSchemaCondition(kc, corev1.ConditionFalse,
+				string(api.LegacyRFReasonExternalReplicationDrift),
+				fmt.Sprintf("External replication for %s differs from the accepted snapshot; resolve external drift.", drift.Keyspace))
+			return result.RequeueSoon(r.DefaultDelay)
+		}
+		return result.Error(err)
+	}
+
+	if len(plan.Changes) == 0 {
+		r.transitionLegacyRFSchemaCondition(kc, corev1.ConditionTrue, "ReplicationValidated",
+			"All legacy system-keyspace external replication matches the accepted snapshot.")
+		return result.Continue()
+	}
+	change := plan.Changes[0]
+	if err := mgmtAPI.AlterKeyspace(change.Keyspace, change.Replication); err != nil {
+		if kerrors.IsSchemaDisagreement(err) {
+			return result.RequeueSoon(r.DefaultDelay)
+		}
+		logger.Error(err, "Failed to alter managed system-keyspace replication", "keyspace", change.Keyspace)
+		return result.Error(fmt.Errorf("alter managed replication for %s: %w", change.Keyspace, err))
+	}
+	return result.RequeueSoon(r.DefaultDelay)
+}
+
+func validatedLegacyRFSchemaSnapshot(kc *api.K8ssandraCluster) (*api.LegacyRFSnapshot, error) {
+	status := kc.Status.LegacyRFDiscovery
+	if status == nil || status.Phase != api.LegacyRFDiscoveryPhaseAccepted || status.AcceptedSnapshot == nil {
+		return nil, fmt.Errorf("reconcile accepted legacy RF schema: accepted discovery snapshot is required")
+	}
+	snapshot := status.AcceptedSnapshot
+	if !legacyRFSnapshotIsIntact(status) {
+		return nil, fmt.Errorf("reconcile accepted legacy RF schema: snapshot hash mismatch")
+	}
+	if snapshot.Replication.SystemAuth == nil || snapshot.Replication.SystemTraces == nil || snapshot.Replication.SystemDistributed == nil {
+		return nil, fmt.Errorf("reconcile accepted legacy RF schema: all three snapshot keyspaces are required")
+	}
+	return snapshot, nil
+}
+
+func (r *K8ssandraClusterReconciler) transitionLegacyRFSchemaCondition(
+	kc *api.K8ssandraCluster,
+	status corev1.ConditionStatus,
+	reason string,
+	message string,
+) {
+	for _, current := range kc.Status.Conditions {
+		if current.Type == api.SystemKeyspaceReplicationReady &&
+			current.Status == status && current.Reason == reason && current.Message == message {
+			return
+		}
+	}
+	now := metav1.Now()
+	kc.Status.SetCondition(api.K8ssandraClusterCondition{
+		Type: api.SystemKeyspaceReplicationReady, Status: status, Reason: reason,
+		Message: message, LastTransitionTime: &now,
+	})
+	if r.Recorder == nil {
+		return
+	}
+	eventType := corev1.EventTypeNormal
+	if status == corev1.ConditionFalse {
+		eventType = corev1.EventTypeWarning
+	}
+	r.Recorder.Eventf(kc, nil, eventType, reason, "SystemKeyspaceReplicationValidation", message)
 }
 
 // updateUserKeyspacesReplication updates the replication factor of user-defined keyspaces.

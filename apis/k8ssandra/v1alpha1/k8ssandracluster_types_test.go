@@ -1,8 +1,12 @@
 package v1alpha1
 
 import (
+	"encoding/json"
+	"math"
+	"strings"
 	"testing"
 
+	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/utils/ptr"
 	"sigs.k8s.io/yaml"
@@ -16,6 +20,163 @@ import (
 
 func TestK8ssandraCluster(t *testing.T) {
 	t.Run("HasStargates", testK8ssandraClusterHasStargates)
+}
+
+func TestLegacyRFDiscoveryAPIWireRoundTrip(t *testing.T) {
+	now := metav1.Now()
+	cluster := legacyRFDiscoveryAPICluster(now)
+
+	encoded, err := json.Marshal(cluster)
+	require.NoError(t, err)
+	jsonText := string(encoded)
+	assert.Contains(t, jsonText, `"legacyCqlCredentialsSecretRef":{"name":"legacy-cql"}`)
+	assert.Contains(t, jsonText, `"legacyCqlTLSSecretRef":{"name":"legacy-cql-tls"}`)
+	assert.Contains(t, jsonText, `"systemAuth":null`)
+	assert.Contains(t, jsonText, `"systemTraces":{}`)
+	assert.Contains(t, jsonText, `"systemDistributed":{"dc10":10,"dc9":9,"dcMax":2147483647}`)
+	assert.NotContains(t, strings.ToLower(jsonText), "private-key-material")
+	assert.NotContains(t, strings.ToLower(jsonText), "supersecret")
+	assert.NotContains(t, strings.ToLower(jsonText), "rawcause")
+
+	var decoded K8ssandraCluster
+	require.NoError(t, json.Unmarshal(encoded, &decoded))
+	require.NotNil(t, decoded.Spec.Cassandra.LegacyCqlTLSSecretRef)
+	assert.Equal(t, "legacy-cql-tls", decoded.Spec.Cassandra.LegacyCqlTLSSecretRef.Name)
+	discovery := requireLegacyRFDiscoveryStatus(t, &decoded)
+	require.Nil(t, discovery.AcceptedSnapshot.Replication.SystemAuth)
+	require.NotNil(t, discovery.AcceptedSnapshot.Replication.SystemTraces)
+	assert.Empty(t, discovery.AcceptedSnapshot.Replication.SystemTraces)
+	assert.Equal(t, int32(math.MaxInt32), discovery.AcceptedSnapshot.Replication.SystemDistributed["dcMax"])
+	assert.True(t, discovery.ManagedCreationObserved)
+	assert.Len(t, discovery.ManagedLocationHistory, 2)
+	assert.Equal(t, LegacyRFReasonExternalReplicationDrift, LegacyRFDiscoveryReason(decoded.Status.Conditions[0].Reason))
+
+	discovery.AcceptedSnapshot.Replication.SystemDistributed["dc9"] = 1
+	assert.Equal(t, int32(9), cluster.Status.LegacyRFDiscovery.AcceptedSnapshot.Replication.SystemDistributed["dc9"])
+}
+
+func TestLegacyRFDiscoveryAPIDeepCopy(t *testing.T) {
+	cluster := legacyRFDiscoveryAPICluster(metav1.Now())
+	copied := cluster.DeepCopy()
+
+	copied.Spec.Cassandra.LegacyCqlCredentialsSecretRef.Name = "changed-credentials"
+	copied.Spec.Cassandra.LegacyCqlTLSSecretRef.Name = "changed-tls"
+
+	assert.Equal(t, "legacy-cql", cluster.Spec.Cassandra.LegacyCqlCredentialsSecretRef.Name)
+	assert.Equal(t, "legacy-cql-tls", cluster.Spec.Cassandra.LegacyCqlTLSSecretRef.Name)
+}
+
+func TestDiscoveryFailureMatrix(t *testing.T) {
+	tests := legacyRFFailureMatrix()
+	seen := make(map[LegacyRFDiscoveryReason]struct{}, len(tests))
+	for _, test := range tests {
+		t.Run(string(test.reason), func(t *testing.T) {
+			failure, found := LegacyRFDiscoveryFailureForReason(test.reason)
+			require.True(t, found)
+			assert.Equal(t, test.retryable, failure.Retryable)
+			assert.Equal(t, test.reason, failure.Reason)
+			assert.NotEmpty(t, failure.Message)
+			assert.NotContains(t, strings.ToLower(failure.Message), "password")
+			assert.NotContains(t, strings.ToLower(failure.Message), "secret data")
+			_, duplicate := seen[test.reason]
+			assert.False(t, duplicate, "failure reason values must be unique")
+			seen[test.reason] = struct{}{}
+		})
+	}
+	_, found := LegacyRFDiscoveryFailureForReason("UnknownReason")
+	assert.False(t, found)
+}
+
+func TestDiscoveryProtocolConstants(t *testing.T) {
+	assert.Equal(t, "k8ssandra.io/legacy-rf-discovery-version", LegacyRFDiscoveryMarkerAnnotation)
+	assert.Equal(t, "v1", LegacyRFDiscoveryMarkerVersion)
+	assert.Equal(t, "v1", LegacyRFDiscoveryProtocolVersion)
+	assert.Equal(t, 1<<20, LegacyRFDiscoveryMaxResultBytes)
+	assert.Equal(t, []string{"system_auth", "system_traces", "system_distributed"}, []string{
+		SystemAuthKeyspace, SystemTracesKeyspace, SystemDistributedKeyspace,
+	})
+	assert.NotEqual(t, NetworkTopologyStrategyClass, NetworkTopologyStrategyQualifiedClass)
+	assert.Equal(t, K8ssandraClusterConditionType("SystemKeyspaceReplicationReady"), SystemKeyspaceReplicationReady)
+}
+
+func legacyRFDiscoveryAPICluster(now metav1.Time) *K8ssandraCluster {
+	location := LegacyRFManagedLocation{
+		K8sContext: "data-plane", Namespace: "migration", Name: "dc-new", DatacenterName: "logical-dc-new",
+	}
+	return &K8ssandraCluster{
+		Spec: K8ssandraClusterSpec{Cassandra: &CassandraClusterTemplate{
+			LegacyCqlCredentialsSecretRef: &corev1.LocalObjectReference{Name: "legacy-cql"},
+			LegacyCqlTLSSecretRef:         &corev1.LocalObjectReference{Name: "legacy-cql-tls"},
+		}},
+		Status: K8ssandraClusterStatus{
+			LegacyRFDiscovery: &LegacyRFDiscoveryStatus{
+				ObservedGeneration: 7, Phase: LegacyRFDiscoveryPhaseAccepted, SnapshotHash: "sha256:snapshot",
+				LastTransitionTime: &now, ManagedCreationObserved: true,
+				CurrentManagedLocations: []LegacyRFManagedLocation{location},
+				ManagedLocationHistory:  []LegacyRFManagedLocation{location, {K8sContext: "old", Namespace: "migration", Name: "dc-old"}},
+				AcceptedSnapshot:        legacyRFSnapshotForAPITest(now, location),
+			},
+			Conditions: []K8ssandraClusterCondition{{
+				Type: SystemKeyspaceReplicationReady, Status: corev1.ConditionFalse,
+				Reason: string(LegacyRFReasonExternalReplicationDrift), Message: "External replication differs from the accepted snapshot.",
+			}},
+		},
+	}
+}
+
+func legacyRFSnapshotForAPITest(now metav1.Time, location LegacyRFManagedLocation) *LegacyRFSnapshot {
+	return &LegacyRFSnapshot{
+		ClusterUID: "uid", AcceptedGeneration: 7, MarkerVersion: LegacyRFDiscoveryMarkerVersion,
+		ProtocolVersion: LegacyRFDiscoveryProtocolVersion, AcceptedSeeds: []string{"192.0.2.1", "192.0.2.2"},
+		AcceptedSeedDigest: "sha256:seeds", AuthoritativeEndpoint: "192.0.2.2:9042",
+		ExpectedClusterName: "legacy", ServerType: ServerDistributionCassandra, SourceVersion: "4.1.8",
+		Partitioner: "Murmur3Partitioner", IdentityFingerprint: "identity", TopologyFingerprint: "topology",
+		SchemaFingerprint: "schema", ObservedExternalDCs: []string{"dc9", "dc10", "dcMax"},
+		Replication: LegacySystemKeyspaceReplication{
+			SystemAuth: nil, SystemTraces: map[string]int32{},
+			SystemDistributed: map[string]int32{"dc9": 9, "dc10": 10, "dcMax": math.MaxInt32},
+		},
+		SecretBindings: []LegacyRFSecretBinding{{
+			Purpose: "credentials", SourceContext: "control-plane", Namespace: "migration",
+			Name: "legacy-cql", Keys: []string{"username", "password"}, ResourceVersion: "42",
+		}},
+		DiscoveryLocation: location, AcceptedManagedLocations: []LegacyRFManagedLocation{location},
+		WorkerImageDigest: "registry.example/operator@sha256:worker", AcceptedAt: now, Hash: "sha256:snapshot",
+	}
+}
+
+func requireLegacyRFDiscoveryStatus(t *testing.T, cluster *K8ssandraCluster) *LegacyRFDiscoveryStatus {
+	t.Helper()
+	require.NotNil(t, cluster.Status.LegacyRFDiscovery)
+	require.NotNil(t, cluster.Status.LegacyRFDiscovery.AcceptedSnapshot)
+	return cluster.Status.LegacyRFDiscovery
+}
+
+type legacyRFFailureTest struct {
+	reason    LegacyRFDiscoveryReason
+	retryable bool
+}
+
+func legacyRFFailureMatrix() []legacyRFFailureTest {
+	return []legacyRFFailureTest{
+		{LegacyRFReasonAdmissionUnavailable, true}, {LegacyRFReasonMarkerInvalid, false},
+		{LegacyRFReasonUnsupportedServerType, false}, {LegacyRFReasonUnsupportedSourceVersion, false},
+		{LegacyRFReasonUnsupportedSecretsProvider, false}, {LegacyRFReasonDiscoveryTooLate, false},
+		{LegacyRFReasonInvalidContactPoint, false}, {LegacyRFReasonJobSchedulingFailed, true},
+		{LegacyRFReasonWorkerImageUnavailable, true}, {LegacyRFReasonWorkerImagePullFailed, true},
+		{LegacyRFReasonDiscoveryDeadlineExceeded, true}, {LegacyRFReasonCredentialSecretInvalid, true},
+		{LegacyRFReasonTLSMaterialInvalid, true}, {LegacyRFReasonAuthenticationRejected, true},
+		{LegacyRFReasonAuthorizationDenied, false}, {LegacyRFReasonTLSFailed, true},
+		{LegacyRFReasonContactUnreachable, true}, {LegacyRFReasonIdentityMismatch, false},
+		{LegacyRFReasonSchemaDisagreement, true}, {LegacyRFReasonTopologyInconsistent, true},
+		{LegacyRFReasonManagedDatacenterNameCollision, false}, {LegacyRFReasonMissingKeyspace, false},
+		{LegacyRFReasonUnsupportedStrategy, false}, {LegacyRFReasonInvalidReplication, false},
+		{LegacyRFReasonStaleDiscoveryResult, true}, {LegacyRFReasonInvalidDiscoveryResult, true},
+		{LegacyRFReasonForgedDiscoveryResult, true}, {LegacyRFReasonDiscoveryResultTooLarge, true},
+		{LegacyRFReasonKubernetesAPIUnavailable, true}, {LegacyRFReasonKubernetesAPIConflict, true},
+		{LegacyRFReasonSnapshotConflict, false}, {LegacyRFReasonManagedStatePresent, false},
+		{LegacyRFReasonExternalReplicationDrift, true},
+	}
 }
 
 func testK8ssandraClusterHasStargates(t *testing.T) {

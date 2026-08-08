@@ -5,6 +5,8 @@ metadata:
   labels:
     control-plane: k8ssandra-operator
 spec:
+  strategy:
+    type: RollingUpdate
   selector:
     matchLabels:
       control-plane: k8ssandra-operator
@@ -19,8 +21,8 @@ spec:
       containers:
       - command:
         - /manager
-        args: []
-#        - --leader-elect
+        args:
+        - --leader-elect
         image: k8ssandra/k8ssandra-operator:latest
         imagePullPolicy: IfNotPresent
         name: k8ssandra-operator
