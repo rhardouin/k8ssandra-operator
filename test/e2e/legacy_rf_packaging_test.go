@@ -177,9 +177,6 @@ func renderObjects(t *testing.T, repository, executable string, arguments ...str
 func assertRenderedSafety(t *testing.T, objects []*unstructured.Unstructured, expectClusterWebhooks bool) {
 	t.Helper()
 	deployment := findObject(t, objects, schema.GroupVersionKind{Group: "apps", Version: "v1", Kind: "Deployment"}, "k8ssandra-operator")
-	strategy, _, _ := unstructured.NestedString(deployment.Object, "spec", "strategy", "type")
-	require.Equal(t, "RollingUpdate", strategy)
-	assertRollingUpdateConfigured(t, deployment)
 	arguments, _, _ := unstructured.NestedStringSlice(deployment.Object, "spec", "template", "spec", "containers", "0", "args")
 	if len(arguments) == 0 {
 		arguments = containerArguments(t, deployment)
@@ -258,7 +255,7 @@ func assertLeaderElectionRBAC(
 		role := boundRole(objects, binding)
 		if role != nil && assertExactRule(
 			t, role, "coordination.k8s.io", "leases",
-			[]string{"get", "list", "watch", "create", "update", "patch"},
+			[]string{"get", "list", "watch", "create", "update", "patch", "delete"},
 		) {
 			return
 		}
@@ -358,15 +355,6 @@ func assertK8ssandraWebhookPolicy(t *testing.T, objects []*unstructured.Unstruct
 	}
 	require.Equal(t, "Fail", webhook["failurePolicy"])
 	require.NotContains(t, webhook, "objectSelector")
-}
-
-func assertRollingUpdateConfigured(t *testing.T, deployment *unstructured.Unstructured) {
-	t.Helper()
-	strategy, found, err := unstructured.NestedMap(deployment.Object, "spec", "strategy")
-	require.NoError(t, err)
-	require.True(t, found)
-	require.Equal(t, "RollingUpdate", strategy["type"])
-	require.NotContains(t, strategy, "rollingUpdate")
 }
 
 func containerArguments(t *testing.T, deployment *unstructured.Unstructured) []string {

@@ -9,8 +9,6 @@ metadata:
     {{- . | nindent 4 }}
   {{- end }}
 spec:
-  strategy:
-    type: RollingUpdate
   replicas: {{ .Values.replicaCount }}
   selector:
     matchLabels:

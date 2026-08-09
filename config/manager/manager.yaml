@@ -5,8 +5,6 @@ metadata:
   labels:
     control-plane: k8ssandra-operator
 spec:
-  strategy:
-    type: RollingUpdate
   selector:
     matchLabels:
       control-plane: k8ssandra-operator
