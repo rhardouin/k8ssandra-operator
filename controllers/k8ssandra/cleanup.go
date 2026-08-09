@@ -50,6 +50,16 @@ func (r *K8ssandraClusterReconciler) checkDeletion(ctx context.Context, kc *k8ss
 			continue
 		}
 
+		// Discovery attempt objects are created before the gate that owns them can run again on a
+		// deleted cluster, and they carry no owner reference because they may live in another
+		// cluster. Purge them here or the copied source credentials outlive the finalizer.
+		if err = PurgeLegacyRFAttemptResources(ctx, remoteClient, namespace, kcKey); err != nil {
+			logger.Error(err, "Failed to delete legacy RF discovery attempt resources",
+				"Context", dcTemplate.K8sContext, "Namespace", namespace)
+			hasErrors = true
+			continue
+		}
+
 		selector := k8ssandralabels.CleanedUpByLabels(kcKey)
 		stargateList := &stargateapi.StargateList{}
 		options := client.ListOptions{
