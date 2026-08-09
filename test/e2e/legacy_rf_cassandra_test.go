@@ -38,6 +38,9 @@ import (
 
 var legacyRFSourceDatacenters = []string{"legacy-a", "legacy-b"}
 
+// legacyRFMatrixDatacenter is the single datacenter of the raw credential/TLS matrix sources.
+const legacyRFMatrixDatacenter = "matrix-dc"
+
 var legacyRFSystemReplication = api.LegacySystemKeyspaceReplication{
 	SystemAuth:        map[string]int32{"legacy-a": 2, "legacy-b": 4},
 	SystemTraces:      map[string]int32{"legacy-a": 1},
@@ -68,7 +71,9 @@ type legacyRFSource struct {
 }
 
 type legacyRFMatrixRow struct {
-	Name        string
+	Name string
+	// ShortID names the Kubernetes objects for this row. Name stays descriptive for evidence.
+	ShortID     string
 	SourceAuth  bool
 	Credentials bool
 	TLS         bool
@@ -275,8 +280,8 @@ func provisionLegacyRFMatrixSource(
 	sourceID string,
 	auth, tlsEnabled bool,
 ) legacyRFSource {
-	suffix := legacyRFScenarioID(t, scenario) + "-matrix-" + sourceID
-	name := framework.CleanupForKubernetes("lrf-raw-" + suffix)
+	suffix := legacyRFScenarioID(t, scenario) + "-" + sourceID
+	name := framework.CleanupForKubernetes("lrfm-" + suffix)
 	source := legacyRFSource{ID: sourceID, Auth: auth, ClusterName: name, RawStatefulSet: name,
 		CredentialSecret: name + "-superuser", ServiceSelector: name}
 	createLegacyRFMatrixCredential(t, ctx, namespace, f, source)
@@ -289,7 +294,28 @@ func provisionLegacyRFMatrixSource(
 	source.PodName = name + "-0"
 	source.Image = statefulSet.Spec.Template.Spec.Containers[0].Image
 	waitForLegacyRFMatrixSource(t, ctx, namespace, f, source)
+	applyLegacyRFMatrixReplication(t, ctx, namespace, f, source)
 	return source
+}
+
+// applyLegacyRFMatrixReplication puts the three supported system keyspaces on
+// NetworkTopologyStrategy. A freshly bootstrapped node ships them as SimpleStrategy, which
+// discovery rightly blocks as UnsupportedStrategy. These rows exercise credential and TLS
+// boundaries, so the source must first be a legitimate discovery candidate.
+func applyLegacyRFMatrixReplication(
+	t *testing.T,
+	ctx context.Context,
+	namespace string,
+	f *framework.E2eFramework,
+	source legacyRFSource,
+) {
+	replication := map[string]int32{legacyRFMatrixDatacenter: 1}
+	for _, keyspace := range []string{api.SystemAuthKeyspace, api.SystemTracesKeyspace, api.SystemDistributedKeyspace} {
+		// alterLegacyRFKeyspace renders every datacenter in the map. cqlReplication only renders
+		// the two base lifecycle datacenters, so it would emit a class-only map here and never
+		// install matrix-dc.
+		alterLegacyRFKeyspace(t, ctx, namespace, f, source, keyspace, replication, source.Auth)
+	}
 }
 
 func createLegacyRFMatrixCredential(
@@ -311,14 +337,49 @@ func createLegacyRFMatrixService(
 	f *framework.E2eFramework,
 	name string,
 ) (string, string) {
+	// This ClusterIP is both the discovery contact point and the additional seed the managed
+	// datacenter inherits from the accepted snapshot. cass-operator publishes no seed service for
+	// these raw sources, so it must also carry internode traffic or the managed node can never
+	// gossip its way into the source ring and never reaches Ready.
 	service := &corev1.Service{ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: namespace}, Spec: corev1.ServiceSpec{
 		Selector:                 map[string]string{"legacy-rf-source": name},
 		PublishNotReadyAddresses: true,
-		Ports:                    []corev1.ServicePort{{Name: "cql", Port: 9042, TargetPort: intstr.FromInt(9042)}},
+		Ports: []corev1.ServicePort{
+			{Name: "cql", Port: 9042, TargetPort: intstr.FromInt(9042)},
+			{Name: "internode", Port: 7000, TargetPort: intstr.FromInt(7000)},
+		},
 	}}
 	require.NoError(t, f.Create(ctx, framework.NewClusterKey(f.DataPlaneContexts[0], namespace, name), service))
 	require.NotEmpty(t, service.Spec.ClusterIP)
+	createLegacyRFMatrixSeedService(t, ctx, namespace, f, name)
 	return name, service.Spec.ClusterIP
+}
+
+// createLegacyRFMatrixSeedService publishes the Pod address itself. The CQL Service above is a
+// ClusterIP that only forwards 9042, so naming it as the Cassandra seed leaves gossip on 7000
+// unanswered and startup fails with "Unable to gossip with any peers". Resolving the seed to the
+// Pod address instead makes this single node its own seed, which is how a standalone source boots.
+func createLegacyRFMatrixSeedService(
+	t *testing.T,
+	ctx context.Context,
+	namespace string,
+	f *framework.E2eFramework,
+	name string,
+) {
+	seedService := &corev1.Service{
+		ObjectMeta: metav1.ObjectMeta{Name: legacyRFMatrixSeedServiceName(name), Namespace: namespace},
+		Spec: corev1.ServiceSpec{
+			ClusterIP:                corev1.ClusterIPNone,
+			Selector:                 map[string]string{"legacy-rf-source": name},
+			PublishNotReadyAddresses: true,
+			Ports:                    []corev1.ServicePort{{Name: "internode", Port: 7000, TargetPort: intstr.FromInt(7000)}},
+		}}
+	require.NoError(t, f.Create(ctx,
+		framework.NewClusterKey(f.DataPlaneContexts[0], namespace, seedService.Name), seedService))
+}
+
+func legacyRFMatrixSeedServiceName(name string) string {
+	return name + "-seed"
 }
 
 func newLegacyRFMatrixStatefulSet(
@@ -356,8 +417,8 @@ func legacyRFMatrixConfig(source legacyRFSource, tlsEnabled bool) string {
 			"truststore": "/etc/client-tls/truststore.jks", "truststore_password": "changeit"}
 	}
 	config, _ := json.Marshal(map[string]any{"cassandra-yaml": cassandraConfig,
-		"cluster-info":       map[string]any{"name": source.ClusterName, "seeds": source.ServiceName},
-		"datacenter-info":    map[string]any{"name": "matrix-dc"},
+		"cluster-info":       map[string]any{"name": source.ClusterName, "seeds": legacyRFMatrixSeedServiceName(source.ServiceName)},
+		"datacenter-info":    map[string]any{"name": legacyRFMatrixDatacenter},
 		"jvm-server-options": map[string]any{"initial_heap_size": 512 << 20, "max_heap_size": 512 << 20}})
 	return string(config)
 }
@@ -386,7 +447,10 @@ func legacyRFMatrixCassandra(version string, tlsEnabled bool) corev1.Container {
 	return corev1.Container{Name: "cassandra", Image: "docker.io/k8ssandra/cass-management-api:" + version + "-ubi",
 		Env: []corev1.EnvVar{{Name: "POD_NAME", ValueFrom: fieldRef("metadata.name")},
 			{Name: "NODE_NAME", ValueFrom: fieldRef("spec.nodeName")}, {Name: "DS_LICENSE", Value: "accept"},
-			{Name: "USE_MGMT_API", Value: "true"}, {Name: "MGMT_API_NO_KEEP_ALIVE", Value: "true"},
+			// No cass-operator drives these raw sources, so the Management API must own the
+			// Cassandra lifecycle and start it itself. MGMT_API_NO_KEEP_ALIVE would disable that
+			// lifecycle manager and leave port 9042 closed forever.
+			{Name: "USE_MGMT_API", Value: "true"},
 			{Name: "MGMT_API_EXPLICIT_START", Value: "false"}},
 		Ports: []corev1.ContainerPort{{Name: "native", ContainerPort: 9042}, {Name: "mgmt-api-http", ContainerPort: 8080}},
 		ReadinessProbe: &corev1.Probe{ProbeHandler: corev1.ProbeHandler{TCPSocket: &corev1.TCPSocketAction{Port: intstr.FromInt(9042)}},
@@ -865,10 +929,12 @@ func runLegacyRFCredentialTLSMatrix(
 	for _, sourceAuth := range []bool{false, true} {
 		for _, tlsEnabled := range []bool{false, true} {
 			sourceID := legacyRFSourceID(sourceAuth, tlsEnabled)
-			source := provisionLegacyRFMatrixSource(t, ctx, namespace, f, scenario, sourceID, sourceAuth, tlsEnabled)
+			sourceShortID := legacyRFMatrixShortID(sourceAuth, tlsEnabled)
+			source := provisionLegacyRFMatrixSource(t, ctx, namespace, f, scenario, sourceShortID, sourceAuth, tlsEnabled)
 			for _, credentials := range []bool{false, true} {
 				for _, targetAuth := range []bool{false, true} {
 					row := legacyRFMatrixRow{Name: legacyRFMatrixRowName(sourceID, credentials, targetAuth),
+						ShortID:    legacyRFMatrixRowShortID(sourceShortID, credentials, targetAuth),
 						SourceAuth: sourceAuth, Credentials: credentials, TLS: tlsEnabled, TargetAuth: targetAuth}
 					phase := runLegacyRFMatrixRow(t, ctx, namespace, f, scenario, source, row, evidence)
 					pairKey := fmt.Sprintf("%t/%t/%t", sourceAuth, credentials, tlsEnabled)
@@ -882,6 +948,7 @@ func runLegacyRFCredentialTLSMatrix(
 			if tlsEnabled {
 				for _, targetAuth := range []bool{false, true} {
 					row := legacyRFMatrixRow{Name: legacyRFMatrixRowName(sourceID+"-mismatch", sourceAuth, targetAuth),
+						ShortID:    legacyRFMatrixRowShortID(sourceShortID+"x", sourceAuth, targetAuth),
 						SourceAuth: sourceAuth, Credentials: sourceAuth, TLS: true, TLSMismatch: true, TargetAuth: targetAuth}
 					require.Equal(t, api.LegacyRFDiscoveryPhaseBlocked,
 						runLegacyRFMatrixRow(t, ctx, namespace, f, scenario, source, row, evidence))
@@ -907,6 +974,32 @@ func legacyRFMatrixRowName(sourceID string, credentials, targetAuth bool) string
 	return fmt.Sprintf("%s-creds-%t-target-auth-%t", sourceID, credentials, targetAuth)
 }
 
+// legacyRFMatrixShortID compresses a matrix coordinate into a few characters. Descriptive row
+// names stay in the evidence, but Kubernetes names derived from them must keep the generated
+// StatefulSet name within the 60 character limit the K8ssandraCluster webhook enforces.
+// "n"/"a" is source authentication off/on, "p"/"t" is plaintext/TLS.
+func legacyRFMatrixShortID(sourceAuth, tlsEnabled bool) string {
+	authPart, tlsPart := "n", "p"
+	if sourceAuth {
+		authPart = "a"
+	}
+	if tlsEnabled {
+		tlsPart = "t"
+	}
+	return authPart + tlsPart
+}
+
+func legacyRFMatrixRowShortID(sourceShortID string, credentials, targetAuth bool) string {
+	return fmt.Sprintf("%s-c%s-t%s", sourceShortID, legacyRFFlag(credentials), legacyRFFlag(targetAuth))
+}
+
+func legacyRFFlag(value bool) string {
+	if value {
+		return "1"
+	}
+	return "0"
+}
+
 func runLegacyRFMatrixRow(
 	t *testing.T,
 	ctx context.Context,
@@ -926,7 +1019,9 @@ func runLegacyRFMatrixRow(
 	if expectedPhase == api.LegacyRFDiscoveryPhaseAccepted && row.TargetAuth == row.SourceAuth {
 		_ = waitForLegacyRFTargetReady(t, ctx, namespace, f, observed)
 		output := queryLegacyRFReplication(t, ctx, namespace, f, source, api.SystemAuthKeyspace, row.SourceAuth)
-		require.Contains(t, output, "legacy-a")
+		// Matrix sources own a single datacenter of their own; legacy-a belongs to the base
+		// lifecycle sources. The external entry must survive the managed datacenter joining.
+		require.Contains(t, output, legacyRFMatrixDatacenter)
 	}
 	evidence.Operations = append(evidence.Operations, legacyRFOperationEvidence{At: time.Now().UTC(),
 		Operation: "credential/TLS matrix", Outcome: fmt.Sprintf("%s:%s", row.Name, expectedPhase)})
@@ -943,9 +1038,9 @@ func configureLegacyRFTargetRow(
 	source legacyRFSource,
 	row legacyRFMatrixRow,
 ) {
-	cleanName := framework.CleanupForKubernetes("legacy-rf-" + row.Name)
+	cleanName := framework.CleanupForKubernetes("lrf-" + row.ShortID)
 	cluster.Name = cleanName
-	cluster.Spec.Cassandra.Datacenters[0].Meta.Name = framework.CleanupForKubernetes("target-" + row.Name)
+	cluster.Spec.Cassandra.Datacenters[0].Meta.Name = framework.CleanupForKubernetes("t-" + row.ShortID)
 	cluster.Spec.Auth = ptr.To(row.TargetAuth)
 	cluster.Spec.Cassandra.LegacyCqlCredentialsSecretRef = nil
 	if row.Credentials {
@@ -1541,7 +1636,8 @@ func TestLegacyRFCredentialTLSMatrixUsesRawPinnedSource(t *testing.T) {
 	var config map[string]map[string]any
 	require.NoError(t, json.Unmarshal([]byte(statefulSet.Spec.Template.Spec.InitContainers[0].Env[7].Value), &config))
 	require.Equal(t, "PasswordAuthenticator", config["cassandra-yaml"]["authenticator"])
-	require.Equal(t, source.ServiceName, config["cluster-info"]["seeds"])
+	require.Equal(t, legacyRFMatrixSeedServiceName(source.ServiceName), config["cluster-info"]["seeds"],
+		"a standalone source must seed from the Pod address, not the CQL ClusterIP")
 }
 
 func TestLegacyRFEvidenceRejectsMissingRequiredFields(t *testing.T) {
