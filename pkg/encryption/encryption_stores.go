@@ -21,12 +21,12 @@ type Stores struct {
 	// ref to the secret that contains the keystore password if password stored in different secret than keystoreSecretRef
 	// if key isn't specified explicitly, "keystore-password" entry will be used
 	// +kubebuilder:validation:Optional
-	KeystorePasswordRef *SecretKeySelector `json:"keystorePasswordSecretRef"`
+	KeystorePasswordRef *SecretKeySelector `json:"keystorePasswordSecretRef,omitempty"`
 
 	// ref to the secret that contains the truststore password if password stored in different secret than keystoreSecretRef
 	// if key isn't specified  explicitly, "truststore-password" entry will be used
 	// +kubebuilder:validation:Optional
-	TruststorePasswordSecretRef *SecretKeySelector `json:"truststorePasswordSecretRef"`
+	TruststorePasswordSecretRef *SecretKeySelector `json:"truststorePasswordSecretRef,omitempty"`
 }
 
 type StoreType string
