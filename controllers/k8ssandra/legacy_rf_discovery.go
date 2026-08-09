@@ -15,6 +15,7 @@ import (
 	api "github.com/k8ssandra/k8ssandra-operator/apis/k8ssandra/v1alpha1"
 	"github.com/k8ssandra/k8ssandra-operator/pkg/clientcache"
 	"github.com/k8ssandra/k8ssandra-operator/pkg/discovery"
+	"github.com/k8ssandra/k8ssandra-operator/pkg/images"
 	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
 	rbacv1 "k8s.io/api/rbac/v1"
@@ -361,7 +362,7 @@ func (manager *directDiscoveryAttempts) Ensure(
 	}
 	resources, err := BuildLegacyRFAttemptResources(LegacyRFAttemptResourcesInput{
 		ClusterKey: manager.clusterKey, Attempt: attempt, Location: location,
-		HMACKey: key, CopiedSecretData: secretData,
+		HMACKey: key, CopiedSecretData: secretData, ImagePullSecrets: images.CollectPullSecrets(),
 	})
 	if err != nil {
 		return DiscoveryAttemptState{}, fmt.Errorf("ensure discovery attempt: %w", err)

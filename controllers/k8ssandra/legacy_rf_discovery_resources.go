@@ -1,6 +1,7 @@
 package k8ssandra
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -15,6 +16,8 @@ import (
 	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
 	rbacv1 "k8s.io/api/rbac/v1"
+	k8serrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/meta"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
@@ -22,17 +25,22 @@ import (
 )
 
 const (
-	legacyRFAttemptDataKey        = "attempt.json"
-	legacyRFResultDataKey         = "result.json"
-	legacyRFHMACDataKey           = "hmac-key"
-	legacyRFHMACKeyBytes          = 32
-	legacyRFJobDeadlineSeconds    = int64(600)
-	legacyRFJobTTLSeconds         = int32(600)
-	legacyRFAuthUsernameKey       = "auth-username"
-	legacyRFAuthPasswordKey       = "auth-password"
-	legacyRFTLSCAKey              = "tls-ca.crt"
-	legacyRFTLSCertificateKey     = "tls-tls.crt"
-	legacyRFTLSPrivateKeyKey      = "tls-tls.key"
+	legacyRFAttemptDataKey     = "attempt.json"
+	legacyRFResultDataKey      = "result.json"
+	legacyRFHMACDataKey        = "hmac-key"
+	legacyRFHMACKeyBytes       = 32
+	legacyRFJobDeadlineSeconds = int64(600)
+	legacyRFJobTTLSeconds      = int32(600)
+	legacyRFAuthUsernameKey    = "auth-username"
+	legacyRFAuthPasswordKey    = "auth-password"
+	legacyRFTLSCAKey           = "tls-ca.crt"
+	legacyRFTLSCertificateKey  = "tls-tls.crt"
+	legacyRFTLSPrivateKeyKey   = "tls-tls.key"
+	// legacyRFComponentLabel marks every attempt object so the deletion path can select them
+	// precisely. The watch labels only carry the cluster name and namespace, which other
+	// operator-managed objects share, so they are not safe to delete by.
+	legacyRFComponentLabel        = "k8ssandra.io/legacy-rf-component"
+	legacyRFComponentValue        = "discovery-attempt"
 	legacyRFClusterUIDAnnotation  = "k8ssandra.io/legacy-rf-cluster-uid"
 	legacyRFAttemptIDAnnotation   = "k8ssandra.io/legacy-rf-attempt-id"
 	legacyRFGenerationAnnotation  = "k8ssandra.io/legacy-rf-generation"
@@ -48,6 +56,10 @@ type LegacyRFAttemptResourcesInput struct {
 	Location         api.LegacyRFManagedLocation
 	HMACKey          []byte
 	CopiedSecretData map[string][]byte
+	// ImagePullSecrets lets the worker Pod pull the manager image from a private registry.
+	// It mirrors what the operator already applies to the Stargate, Reaper and Medusa
+	// workloads it creates, so a discovery Job is not the one workload left unable to pull.
+	ImagePullSecrets []corev1.LocalObjectReference
 }
 
 // LegacyRFAttemptResources contains every namespaced object for one attempt.
@@ -124,6 +136,7 @@ func newAttemptMetadata(input LegacyRFAttemptResourcesInput) attemptMetadata {
 	prefix := truncateDNSLabel(input.ClusterKey.Name, 39)
 	baseName := fmt.Sprintf("%s-legacy-rf-%s", prefix, suffix)
 	labels := k8ssandralabels.WatchedByK8ssandraClusterLabels(input.ClusterKey)
+	labels[legacyRFComponentLabel] = legacyRFComponentValue
 	annotations := map[string]string{
 		legacyRFClusterUIDAnnotation:  input.Attempt.ClusterUID,
 		legacyRFAttemptIDAnnotation:   input.Attempt.AttemptID,
@@ -199,7 +212,8 @@ func newAttemptJob(
 			TTLSecondsAfterFinished: int32Value(legacyRFJobTTLSeconds),
 			Template: corev1.PodTemplateSpec{ObjectMeta: metav1.ObjectMeta{Labels: copyStringMap(metadata.labels), Annotations: copyStringMap(metadata.annotations)},
 				Spec: corev1.PodSpec{ServiceAccountName: resources.ServiceAccount.Name, AutomountServiceAccountToken: boolValue(true),
-					RestartPolicy: corev1.RestartPolicyNever, SecurityContext: &corev1.PodSecurityContext{
+					ImagePullSecrets: input.ImagePullSecrets,
+					RestartPolicy:    corev1.RestartPolicyNever, SecurityContext: &corev1.PodSecurityContext{
 						RunAsNonRoot: boolValue(true), FSGroup: int64Value(65532),
 						SeccompProfile: &corev1.SeccompProfile{Type: corev1.SeccompProfileTypeRuntimeDefault}},
 					Containers: []corev1.Container{container}, Volumes: workerVolumes(input, resources)}},
@@ -303,3 +317,52 @@ func copyByteMap(source map[string][]byte) map[string][]byte {
 func boolValue(value bool) *bool    { return &value }
 func int32Value(value int32) *int32 { return &value }
 func int64Value(value int64) *int64 { return &value }
+
+// PurgeLegacyRFAttemptResources deletes every discovery attempt object correlated to one
+// K8ssandraCluster in one namespace, whatever attempt produced it.
+//
+// The regular cleanup path runs inside the discovery gate and needs the attempt that created the
+// objects. Deletion runs before that gate, so a cluster removed while discovery is still pending
+// or blocked would otherwise leave its Job, its RBAC, and above all the Secret holding the copied
+// source credentials behind. These objects live in the data plane, possibly in another cluster, so
+// no owner reference can garbage-collect them.
+//
+// Objects are listed and deleted one by one on purpose: DeleteAllOf needs the deletecollection
+// verb, which the operator Role does not grant.
+func PurgeLegacyRFAttemptResources(
+	ctx context.Context,
+	directClient client.Client,
+	namespace string,
+	clusterKey types.NamespacedName,
+) error {
+	selector := client.MatchingLabels(k8ssandralabels.WatchedByK8ssandraClusterLabels(clusterKey))
+	selector[legacyRFComponentLabel] = legacyRFComponentValue
+	options := []client.ListOption{client.InNamespace(namespace), selector}
+
+	lists := []client.ObjectList{
+		&batchv1.JobList{}, &corev1.PodList{}, &corev1.ConfigMapList{}, &corev1.SecretList{},
+		&corev1.ServiceAccountList{}, &rbacv1.RoleBindingList{}, &rbacv1.RoleList{},
+	}
+	for _, list := range lists {
+		if err := directClient.List(ctx, list, options...); err != nil {
+			return fmt.Errorf("purge discovery attempt resources: list: %w", err)
+		}
+		objects, err := meta.ExtractList(list)
+		if err != nil {
+			return fmt.Errorf("purge discovery attempt resources: extract: %w", err)
+		}
+		for _, item := range objects {
+			object, ok := item.(client.Object)
+			if !ok {
+				continue
+			}
+			// Background propagation removes the Job's Pods; the Pod sweep above only covers
+			// Pods an already deleted Job left behind.
+			err := directClient.Delete(ctx, object, client.PropagationPolicy(metav1.DeletePropagationBackground))
+			if err != nil && !k8serrors.IsNotFound(err) {
+				return fmt.Errorf("purge discovery attempt resources: delete: %w", err)
+			}
+		}
+	}
+	return nil
+}
