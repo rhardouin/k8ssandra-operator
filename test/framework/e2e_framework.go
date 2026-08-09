@@ -571,7 +571,7 @@ func (f *E2eFramework) DeployK8sClientConfigs(namespace, srcKubeconfig, destKube
 	for _, srcContext := range f.DataPlaneContexts {
 		f.logger.Info("Creating ClientConfig", "src-context", srcContext)
 		cmd := exec.Command(
-			filepath.Join("..", "..", "scripts", "create-clientconfig.sh"),
+			"python3", filepath.Join("..", "..", "scripts", "create_clientconfig.py"),
 			"--src-kubeconfig", srcKubeconfig,
 			"--dest-kubeconfig", destKubeconfig,
 			"--src-context", srcContext,
