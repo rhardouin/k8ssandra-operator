@@ -2,14 +2,8 @@ package e2e
 
 import (
 	"context"
-	"crypto/rand"
-	"crypto/rsa"
-	"crypto/x509"
-	"crypto/x509/pkix"
 	"encoding/json"
-	"encoding/pem"
 	"fmt"
-	"math/big"
 	"os"
 	"path/filepath"
 	"sort"
@@ -21,14 +15,12 @@ import (
 	api "github.com/k8ssandra/k8ssandra-operator/apis/k8ssandra/v1alpha1"
 	"github.com/k8ssandra/k8ssandra-operator/test/framework"
 	"github.com/stretchr/testify/require"
-	appsv1 "k8s.io/api/apps/v1"
 	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
 	discoveryv1 "k8s.io/api/discovery/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/util/intstr"
 	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/utils/ptr"
@@ -37,9 +29,6 @@ import (
 )
 
 var legacyRFSourceDatacenters = []string{"legacy-a", "legacy-b"}
-
-// legacyRFMatrixDatacenter is the single datacenter of the raw credential/TLS matrix sources.
-const legacyRFMatrixDatacenter = "matrix-dc"
 
 var legacyRFSystemReplication = api.LegacySystemKeyspaceReplication{
 	SystemAuth:        map[string]int32{"legacy-a": 2, "legacy-b": 4},
@@ -65,20 +54,6 @@ type legacyRFSource struct {
 	PodName          string
 	Image            string
 	CredentialSecret string
-	TLSSecret        string
-	WrongTLSSecret   string
-	RawStatefulSet   string
-}
-
-type legacyRFMatrixRow struct {
-	Name string
-	// ShortID names the Kubernetes objects for this row. Name stays descriptive for evidence.
-	ShortID     string
-	SourceAuth  bool
-	Credentials bool
-	TLS         bool
-	TLSMismatch bool
-	TargetAuth  bool
 }
 
 type legacyRFCreateClient interface {
@@ -142,9 +117,9 @@ func runLegacyRFCassandraLifecycle(
 		}
 		require.NoError(t, err)
 	}()
-	// Primary scenarios isolate RF preservation from credential transport. The
-	// 4.1 raw matrix below owns authenticated and TLS boundary coverage.
-	source := provisionLegacyRFSource(t, ctx, namespace, f, scenario, "base", scenario.SourceAuth, false)
+	// The 4.0 scenario runs against an authenticated source, the other two anonymously, so the
+	// three scenarios together cover both credential paths of the discovery contract.
+	source := provisionLegacyRFSource(t, ctx, namespace, f, scenario, "base", scenario.SourceAuth)
 	evidence.SourceImage = source.Image
 
 	recordLegacyRFSourceAlters(evidence)
@@ -167,9 +142,6 @@ func runLegacyRFCassandraLifecycle(
 	assertLegacyRFSourceRowsAfterBootstrap(t, ctx, namespace, f, source, cluster, evidence)
 	runLegacyRFPostReadySchema(t, ctx, namespace, f, source, cluster, evidence)
 	collectLegacyRFLiveEvidence(t, ctx, namespace, f, accepted, evidence)
-	if scenario.Name == "LegacyRFDiscoveryFrom4.1Cluster" {
-		runLegacyRFCredentialTLSMatrix(t, ctx, namespace, f, scenario, cluster, evidence)
-	}
 }
 
 func waitForLegacyRFPreAcceptanceJob(
@@ -210,7 +182,7 @@ func provisionLegacyRFSource(
 	f *framework.E2eFramework,
 	scenario legacyRFCassandraScenario,
 	sourceID string,
-	auth, tlsEnabled bool,
+	auth bool,
 ) legacyRFSource {
 	suffix := legacyRFScenarioID(t, scenario) + "-" + sourceID
 	source := legacyRFSource{ID: sourceID, Auth: auth, ClusterName: "lrfs-" + suffix}
@@ -221,11 +193,8 @@ func provisionLegacyRFSource(
 		if index == 0 {
 			source.ServiceSelector = dcName
 			source.ServiceName, source.ServiceIP = createLegacyRFSourceService(t, ctx, namespace, f, resourceName, dcName)
-			if tlsEnabled {
-				source.TLSSecret, source.WrongTLSSecret = createLegacyRFSourceTLS(t, ctx, namespace, f, suffix, source.ServiceIP)
-			}
 		}
-		dc := newLegacyRFSourceDatacenter(namespace, dcName, scenario.Version, source, auth, tlsEnabled, index > 0)
+		dc := newLegacyRFSourceDatacenter(namespace, dcName, scenario.Version, source, auth, index > 0)
 		if index == 0 {
 			require.NoError(t, waitForLegacyRFCassandraDatacenterWebhook(ctx, f.Client, dc, time.Minute, time.Second))
 		}
@@ -247,18 +216,6 @@ func provisionLegacyRFSource(
 	return source
 }
 
-func allLegacyRFContainersReady(pod *corev1.Pod) bool {
-	if len(pod.Status.ContainerStatuses) == 0 {
-		return false
-	}
-	for _, status := range pod.Status.ContainerStatuses {
-		if !status.Ready {
-			return false
-		}
-	}
-	return true
-}
-
 func createLegacyRFSourceSecret(
 	t *testing.T,
 	ctx context.Context,
@@ -269,233 +226,6 @@ func createLegacyRFSourceSecret(
 	secret := &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: source.CredentialSecret, Namespace: namespace},
 		StringData: map[string]string{"username": "legacy-admin", "password": "legacy-rf-e2e-only"}}
 	require.NoError(t, f.Create(ctx, framework.NewClusterKey(f.DataPlaneContexts[0], namespace, secret.Name), secret))
-}
-
-func provisionLegacyRFMatrixSource(
-	t *testing.T,
-	ctx context.Context,
-	namespace string,
-	f *framework.E2eFramework,
-	scenario legacyRFCassandraScenario,
-	sourceID string,
-	auth, tlsEnabled bool,
-) legacyRFSource {
-	suffix := legacyRFScenarioID(t, scenario) + "-" + sourceID
-	name := framework.CleanupForKubernetes("lrfm-" + suffix)
-	source := legacyRFSource{ID: sourceID, Auth: auth, ClusterName: name, RawStatefulSet: name,
-		CredentialSecret: name + "-superuser", ServiceSelector: name}
-	createLegacyRFMatrixCredential(t, ctx, namespace, f, source)
-	source.ServiceName, source.ServiceIP = createLegacyRFMatrixService(t, ctx, namespace, f, name)
-	if tlsEnabled {
-		source.TLSSecret, source.WrongTLSSecret = createLegacyRFSourceTLS(t, ctx, namespace, f, suffix, source.ServiceIP)
-	}
-	statefulSet := newLegacyRFMatrixStatefulSet(namespace, scenario.Version, source, tlsEnabled)
-	require.NoError(t, f.Create(ctx, framework.NewClusterKey(f.DataPlaneContexts[0], namespace, name), statefulSet))
-	source.PodName = name + "-0"
-	source.Image = statefulSet.Spec.Template.Spec.Containers[0].Image
-	waitForLegacyRFMatrixSource(t, ctx, namespace, f, source)
-	applyLegacyRFMatrixReplication(t, ctx, namespace, f, source)
-	return source
-}
-
-// applyLegacyRFMatrixReplication puts the three supported system keyspaces on
-// NetworkTopologyStrategy. A freshly bootstrapped node ships them as SimpleStrategy, which
-// discovery rightly blocks as UnsupportedStrategy. These rows exercise credential and TLS
-// boundaries, so the source must first be a legitimate discovery candidate.
-func applyLegacyRFMatrixReplication(
-	t *testing.T,
-	ctx context.Context,
-	namespace string,
-	f *framework.E2eFramework,
-	source legacyRFSource,
-) {
-	replication := map[string]int32{legacyRFMatrixDatacenter: 1}
-	for _, keyspace := range []string{api.SystemAuthKeyspace, api.SystemTracesKeyspace, api.SystemDistributedKeyspace} {
-		// alterLegacyRFKeyspace renders every datacenter in the map. cqlReplication only renders
-		// the two base lifecycle datacenters, so it would emit a class-only map here and never
-		// install matrix-dc.
-		alterLegacyRFKeyspace(t, ctx, namespace, f, source, keyspace, replication, source.Auth)
-	}
-}
-
-func createLegacyRFMatrixCredential(
-	t *testing.T,
-	ctx context.Context,
-	namespace string,
-	f *framework.E2eFramework,
-	source legacyRFSource,
-) {
-	secret := &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: source.CredentialSecret, Namespace: namespace},
-		StringData: map[string]string{"username": "cassandra", "password": "cassandra"}}
-	require.NoError(t, f.Create(ctx, framework.NewClusterKey(f.DataPlaneContexts[0], namespace, secret.Name), secret))
-}
-
-func createLegacyRFMatrixService(
-	t *testing.T,
-	ctx context.Context,
-	namespace string,
-	f *framework.E2eFramework,
-	name string,
-) (string, string) {
-	// This ClusterIP is both the discovery contact point and the additional seed the managed
-	// datacenter inherits from the accepted snapshot. cass-operator publishes no seed service for
-	// these raw sources, so it must also carry internode traffic or the managed node can never
-	// gossip its way into the source ring and never reaches Ready.
-	service := &corev1.Service{ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: namespace}, Spec: corev1.ServiceSpec{
-		Selector:                 map[string]string{"legacy-rf-source": name},
-		PublishNotReadyAddresses: true,
-		Ports: []corev1.ServicePort{
-			{Name: "cql", Port: 9042, TargetPort: intstr.FromInt(9042)},
-			{Name: "internode", Port: 7000, TargetPort: intstr.FromInt(7000)},
-		},
-	}}
-	require.NoError(t, f.Create(ctx, framework.NewClusterKey(f.DataPlaneContexts[0], namespace, name), service))
-	require.NotEmpty(t, service.Spec.ClusterIP)
-	createLegacyRFMatrixSeedService(t, ctx, namespace, f, name)
-	return name, service.Spec.ClusterIP
-}
-
-// createLegacyRFMatrixSeedService publishes the Pod address itself. The CQL Service above is a
-// ClusterIP that only forwards 9042, so naming it as the Cassandra seed leaves gossip on 7000
-// unanswered and startup fails with "Unable to gossip with any peers". Resolving the seed to the
-// Pod address instead makes this single node its own seed, which is how a standalone source boots.
-func createLegacyRFMatrixSeedService(
-	t *testing.T,
-	ctx context.Context,
-	namespace string,
-	f *framework.E2eFramework,
-	name string,
-) {
-	seedService := &corev1.Service{
-		ObjectMeta: metav1.ObjectMeta{Name: legacyRFMatrixSeedServiceName(name), Namespace: namespace},
-		Spec: corev1.ServiceSpec{
-			ClusterIP:                corev1.ClusterIPNone,
-			Selector:                 map[string]string{"legacy-rf-source": name},
-			PublishNotReadyAddresses: true,
-			Ports:                    []corev1.ServicePort{{Name: "internode", Port: 7000, TargetPort: intstr.FromInt(7000)}},
-		}}
-	require.NoError(t, f.Create(ctx,
-		framework.NewClusterKey(f.DataPlaneContexts[0], namespace, seedService.Name), seedService))
-}
-
-func legacyRFMatrixSeedServiceName(name string) string {
-	return name + "-seed"
-}
-
-func newLegacyRFMatrixStatefulSet(
-	namespace, version string,
-	source legacyRFSource,
-	tlsEnabled bool,
-) *appsv1.StatefulSet {
-	labels := map[string]string{"legacy-rf-source": source.RawStatefulSet}
-	config := legacyRFMatrixConfig(source, tlsEnabled)
-	replicas := int32(1)
-	return &appsv1.StatefulSet{ObjectMeta: metav1.ObjectMeta{Name: source.RawStatefulSet, Namespace: namespace},
-		Spec: appsv1.StatefulSetSpec{ServiceName: source.ServiceName, Replicas: &replicas,
-			Selector: &metav1.LabelSelector{MatchLabels: labels},
-			Template: corev1.PodTemplateSpec{ObjectMeta: metav1.ObjectMeta{Labels: labels}, Spec: corev1.PodSpec{
-				InitContainers: []corev1.Container{legacyRFMatrixConfigBuilder(version, config)},
-				Containers:     []corev1.Container{legacyRFMatrixCassandra(version, tlsEnabled)},
-				Volumes:        legacyRFMatrixVolumes(tlsEnabled, source),
-			}},
-		}}
-}
-
-func legacyRFMatrixConfig(source legacyRFSource, tlsEnabled bool) string {
-	cassandraConfig := map[string]any{
-		"cluster_name": source.ClusterName, "endpoint_snitch": "GossipingPropertyFileSnitch", "auto_snapshot": false,
-		"authenticator": "AllowAllAuthenticator", "authorizer": "AllowAllAuthorizer", "role_manager": "CassandraRoleManager",
-		"memtable_flush_writers": 1, "concurrent_compactors": 1, "concurrent_reads": 2, "concurrent_writes": 2,
-	}
-	if source.Auth {
-		cassandraConfig["authenticator"] = "PasswordAuthenticator"
-		cassandraConfig["authorizer"] = "CassandraAuthorizer"
-	}
-	if tlsEnabled {
-		cassandraConfig["client_encryption_options"] = map[string]any{"enabled": true, "optional": true,
-			"keystore": "/etc/client-tls/keystore.jks", "keystore_password": "changeit",
-			"truststore": "/etc/client-tls/truststore.jks", "truststore_password": "changeit"}
-	}
-	config, _ := json.Marshal(map[string]any{"cassandra-yaml": cassandraConfig,
-		"cluster-info":       map[string]any{"name": source.ClusterName, "seeds": legacyRFMatrixSeedServiceName(source.ServiceName)},
-		"datacenter-info":    map[string]any{"name": legacyRFMatrixDatacenter},
-		"jvm-server-options": map[string]any{"initial_heap_size": 512 << 20, "max_heap_size": 512 << 20}})
-	return string(config)
-}
-
-func legacyRFMatrixConfigBuilder(version, config string) corev1.Container {
-	return corev1.Container{Name: "server-config-init", Image: "docker.io/datastax/cass-config-builder:1.0-ubi",
-		Env: []corev1.EnvVar{
-			{Name: "POD_IP", ValueFrom: fieldRef("status.podIP")}, {Name: "HOST_IP", ValueFrom: fieldRef("status.hostIP")},
-			{Name: "USE_HOST_IP_FOR_BROADCAST", Value: "false"}, {Name: "RACK_NAME", Value: "default"},
-			{Name: "PRODUCT_VERSION", Value: version}, {Name: "PRODUCT_NAME", Value: "cassandra"},
-			{Name: "POD_NAME", ValueFrom: fieldRef("metadata.name")}, {Name: "CONFIG_FILE_DATA", Value: config},
-		}, VolumeMounts: []corev1.VolumeMount{{Name: "server-config", MountPath: "/config"}}}
-}
-
-func fieldRef(path string) *corev1.EnvVarSource {
-	return &corev1.EnvVarSource{FieldRef: &corev1.ObjectFieldSelector{FieldPath: path}}
-}
-
-func legacyRFMatrixCassandra(version string, tlsEnabled bool) corev1.Container {
-	mounts := []corev1.VolumeMount{{Name: "server-config", MountPath: "/config"},
-		{Name: "server-data", MountPath: "/var/lib/cassandra"}, {Name: "server-logs", MountPath: "/var/log/cassandra"},
-		{Name: "tmp", MountPath: "/tmp"}}
-	if tlsEnabled {
-		mounts = append(mounts, corev1.VolumeMount{Name: "client-tls", MountPath: "/etc/client-tls", ReadOnly: true})
-	}
-	return corev1.Container{Name: "cassandra", Image: "docker.io/k8ssandra/cass-management-api:" + version + "-ubi",
-		Env: []corev1.EnvVar{{Name: "POD_NAME", ValueFrom: fieldRef("metadata.name")},
-			{Name: "NODE_NAME", ValueFrom: fieldRef("spec.nodeName")}, {Name: "DS_LICENSE", Value: "accept"},
-			// No cass-operator drives these raw sources, so the Management API must own the
-			// Cassandra lifecycle and start it itself. MGMT_API_NO_KEEP_ALIVE would disable that
-			// lifecycle manager and leave port 9042 closed forever.
-			{Name: "USE_MGMT_API", Value: "true"},
-			{Name: "MGMT_API_EXPLICIT_START", Value: "false"}},
-		Ports: []corev1.ContainerPort{{Name: "native", ContainerPort: 9042}, {Name: "mgmt-api-http", ContainerPort: 8080}},
-		ReadinessProbe: &corev1.Probe{ProbeHandler: corev1.ProbeHandler{TCPSocket: &corev1.TCPSocketAction{Port: intstr.FromInt(9042)}},
-			InitialDelaySeconds: 10, PeriodSeconds: 5},
-		Resources: corev1.ResourceRequirements{Requests: corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("100m"),
-			corev1.ResourceMemory: resource.MustParse("1Gi")}, Limits: corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("1"),
-			corev1.ResourceMemory: resource.MustParse("1Gi")}}, VolumeMounts: mounts}
-}
-
-func legacyRFMatrixVolumes(tlsEnabled bool, source legacyRFSource) []corev1.Volume {
-	volumes := []corev1.Volume{
-		{Name: "server-config", VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{}}},
-		{Name: "server-data", VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{}}},
-		{Name: "server-logs", VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{}}},
-		{Name: "tmp", VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{}}},
-	}
-	if tlsEnabled {
-		volumes = append(volumes, corev1.Volume{Name: "client-tls", VolumeSource: corev1.VolumeSource{
-			Secret: &corev1.SecretVolumeSource{SecretName: source.TLSSecret + "-server"}}})
-	}
-	return volumes
-}
-
-func waitForLegacyRFMatrixSource(
-	t *testing.T,
-	ctx context.Context,
-	namespace string,
-	f *framework.E2eFramework,
-	source legacyRFSource,
-) {
-	require.NoError(t, wait.PollUntilContextTimeout(ctx, 5*time.Second, 10*time.Minute, true,
-		func(ctx context.Context) (bool, error) {
-			pod := &corev1.Pod{}
-			key := framework.NewClusterKey(f.DataPlaneContexts[0], namespace, source.PodName)
-			if err := f.Get(ctx, key, pod); err != nil || !allLegacyRFContainersReady(pod) {
-				return false, client.IgnoreNotFound(err)
-			}
-			query := "SELECT cluster_name FROM system.local"
-			if source.Auth {
-				_, err := f.ExecuteCql(ctx, f.DataPlaneContexts[0], namespace, source.ClusterName, source.PodName, query)
-				return err == nil, nil
-			}
-			_, err := f.ExecuteCqlNoAuth(f.DataPlaneContexts[0], namespace, source.PodName, query)
-			return err == nil, nil
-		}))
 }
 
 func legacyRFScenarioID(t *testing.T, scenario legacyRFCassandraScenario) string {
@@ -557,95 +287,10 @@ func setLegacyRFSourceServiceEnabled(
 		}))
 }
 
-func createLegacyRFSourceTLS(
-	t *testing.T,
-	ctx context.Context,
-	namespace string,
-	f *framework.E2eFramework,
-	suffix, serviceIP string,
-) (string, string) {
-	base := "legacy-rf-tls-" + suffix
-	password := &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: base + "-jks-password", Namespace: namespace},
-		StringData: map[string]string{"password": "changeit"}}
-	require.NoError(t, f.Create(ctx, framework.NewClusterKey(f.DataPlaneContexts[0], namespace, password.Name), password))
-	createLegacyRFCertManagerObject(t, ctx, namespace, f, "Issuer", base+"-selfsigned",
-		map[string]any{"selfSigned": map[string]any{}})
-	createLegacyRFCertManagerObject(t, ctx, namespace, f, "Certificate", base+"-ca", map[string]any{
-		"isCA": true, "commonName": base + "-ca", "secretName": base + "-ca",
-		"issuerRef": map[string]any{"name": base + "-selfsigned", "kind": "Issuer"},
-	})
-	waitForLegacyRFSecretKey(t, ctx, namespace, f, base+"-ca", "tls.crt")
-	createLegacyRFCertManagerObject(t, ctx, namespace, f, "Issuer", base+"-issuer",
-		map[string]any{"ca": map[string]any{"secretName": base + "-ca"}})
-	createLegacyRFCertManagerObject(t, ctx, namespace, f, "Certificate", base+"-server", map[string]any{
-		"secretName": base + "-server", "ipAddresses": []any{serviceIP},
-		"privateKey": map[string]any{"algorithm": "RSA", "encoding": "PKCS1", "size": int64(2048)},
-		"keystores": map[string]any{"jks": map[string]any{"create": true,
-			"passwordSecretRef": map[string]any{"name": base + "-jks-password", "key": "password"}}},
-		"issuerRef": map[string]any{"name": base + "-issuer", "kind": "Issuer"},
-	})
-	serverSecret := waitForLegacyRFSecretKey(t, ctx, namespace, f, base+"-server", "keystore.jks")
-	discoverySecret := &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: base, Namespace: namespace},
-		Data: map[string][]byte{"ca.crt": append([]byte(nil), serverSecret.Data["ca.crt"]...)}}
-	require.NotEmpty(t, discoverySecret.Data["ca.crt"])
-	require.NoError(t, f.Create(ctx, framework.NewClusterKey(f.DataPlaneContexts[0], namespace, base), discoverySecret))
-	wrongName := base + "-wrong"
-	wrongSecret := &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: wrongName, Namespace: namespace},
-		Data: map[string][]byte{"ca.crt": newLegacyRFTestCA(t)}}
-	require.NoError(t, f.Create(ctx, framework.NewClusterKey(f.DataPlaneContexts[0], namespace, wrongName), wrongSecret))
-	return base, wrongName
-}
-
-func createLegacyRFCertManagerObject(
-	t *testing.T,
-	ctx context.Context,
-	namespace string,
-	f *framework.E2eFramework,
-	kind, name string,
-	spec map[string]any,
-) {
-	object := &unstructured.Unstructured{Object: map[string]any{
-		"apiVersion": "cert-manager.io/v1", "kind": kind,
-		"metadata": map[string]any{"name": name, "namespace": namespace}, "spec": spec,
-	}}
-	require.NoError(t, f.Create(ctx, framework.NewClusterKey(f.DataPlaneContexts[0], namespace, name), object))
-}
-
-func waitForLegacyRFSecretKey(
-	t *testing.T,
-	ctx context.Context,
-	namespace string,
-	f *framework.E2eFramework,
-	name, dataKey string,
-) *corev1.Secret {
-	secret := &corev1.Secret{}
-	key := framework.NewClusterKey(f.DataPlaneContexts[0], namespace, name)
-	require.NoError(t, wait.PollUntilContextTimeout(ctx, 2*time.Second, 3*time.Minute, true,
-		func(ctx context.Context) (bool, error) {
-			if err := f.Get(ctx, key, secret); err != nil {
-				return false, client.IgnoreNotFound(err)
-			}
-			return len(secret.Data[dataKey]) > 0, nil
-		}))
-	return secret.DeepCopy()
-}
-
-func newLegacyRFTestCA(t *testing.T) []byte {
-	t.Helper()
-	privateKey, err := rsa.GenerateKey(rand.Reader, 2048)
-	require.NoError(t, err)
-	template := &x509.Certificate{SerialNumber: big.NewInt(1), Subject: pkix.Name{CommonName: "wrong-legacy-rf-ca"},
-		NotBefore: time.Now().Add(-time.Minute), NotAfter: time.Now().Add(time.Hour),
-		IsCA: true, BasicConstraintsValid: true, KeyUsage: x509.KeyUsageCertSign | x509.KeyUsageDigitalSignature}
-	certificate, err := x509.CreateCertificate(rand.Reader, template, template, &privateKey.PublicKey, privateKey)
-	require.NoError(t, err)
-	return pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: certificate})
-}
-
 func newLegacyRFSourceDatacenter(
 	namespace, dcName, version string,
 	source legacyRFSource,
-	auth, tlsEnabled, joinsExisting bool,
+	auth, joinsExisting bool,
 ) *cassdcapi.CassandraDatacenter {
 	cassandraConfig := map[string]any{"cluster_name": source.ClusterName, "endpoint_snitch": "GossipingPropertyFileSnitch",
 		"auto_snapshot": false, "memtable_flush_writers": 1, "concurrent_compactors": 1,
@@ -658,13 +303,6 @@ func newLegacyRFSourceDatacenter(
 		cassandraConfig["authenticator"] = "AllowAllAuthenticator"
 		cassandraConfig["authorizer"] = "AllowAllAuthorizer"
 		cassandraConfig["role_manager"] = "CassandraRoleManager"
-	}
-	if tlsEnabled {
-		cassandraConfig["client_encryption_options"] = map[string]any{
-			"enabled": true, "optional": true,
-			"keystore": "/etc/client-tls/keystore.jks", "keystore_password": "changeit",
-			"truststore": "/etc/client-tls/truststore.jks", "truststore_password": "changeit",
-		}
 	}
 	config, _ := json.Marshal(map[string]any{"cassandra-yaml": cassandraConfig,
 		"jvm-server-options": map[string]any{"initial_heap_size": 512 << 20, "max_heap_size": 512 << 20}})
@@ -684,12 +322,6 @@ func newLegacyRFSourceDatacenter(
 			}}}}
 	if !auth || joinsExisting {
 		dc.Annotations = map[string]string{cassdcapi.SkipUserCreationAnnotation: "true"}
-	}
-	if tlsEnabled {
-		dc.Spec.StorageConfig.AdditionalVolumes = cassdcapi.AdditionalVolumesSlice{{
-			Name: "client-tls", MountPath: "/etc/client-tls",
-			VolumeSource: &corev1.VolumeSource{Secret: &corev1.SecretVolumeSource{SecretName: source.TLSSecret + "-server"}},
-		}}
 	}
 	if auth {
 		dc.Spec.SuperuserSecretName = source.CredentialSecret
@@ -913,271 +545,6 @@ func assertLegacyRFAcceptedSnapshot(
 	}
 	evidence.Snapshot, _ = json.Marshal(snapshot)
 	evidence.SnapshotHash = snapshot.Hash
-}
-
-func runLegacyRFCredentialTLSMatrix(
-	t *testing.T,
-	ctx context.Context,
-	namespace string,
-	f *framework.E2eFramework,
-	scenario legacyRFCassandraScenario,
-	baselineCluster *api.K8ssandraCluster,
-	evidence *legacyRFEvidence,
-) {
-	deleteLegacyRFTarget(t, ctx, f, baselineCluster)
-	pairedOutcomes := make(map[string]api.LegacyRFDiscoveryPhase)
-	for _, sourceAuth := range []bool{false, true} {
-		for _, tlsEnabled := range []bool{false, true} {
-			sourceID := legacyRFSourceID(sourceAuth, tlsEnabled)
-			sourceShortID := legacyRFMatrixShortID(sourceAuth, tlsEnabled)
-			source := provisionLegacyRFMatrixSource(t, ctx, namespace, f, scenario, sourceShortID, sourceAuth, tlsEnabled)
-			for _, credentials := range []bool{false, true} {
-				for _, targetAuth := range []bool{false, true} {
-					row := legacyRFMatrixRow{Name: legacyRFMatrixRowName(sourceID, credentials, targetAuth),
-						ShortID:    legacyRFMatrixRowShortID(sourceShortID, credentials, targetAuth),
-						SourceAuth: sourceAuth, Credentials: credentials, TLS: tlsEnabled, TargetAuth: targetAuth}
-					phase := runLegacyRFMatrixRow(t, ctx, namespace, f, scenario, source, row, evidence)
-					pairKey := fmt.Sprintf("%t/%t/%t", sourceAuth, credentials, tlsEnabled)
-					if prior, found := pairedOutcomes[pairKey]; found {
-						require.Equal(t, prior, phase, "managed-target auth changed source outcome for %s", pairKey)
-					} else {
-						pairedOutcomes[pairKey] = phase
-					}
-				}
-			}
-			if tlsEnabled {
-				for _, targetAuth := range []bool{false, true} {
-					row := legacyRFMatrixRow{Name: legacyRFMatrixRowName(sourceID+"-mismatch", sourceAuth, targetAuth),
-						ShortID:    legacyRFMatrixRowShortID(sourceShortID+"x", sourceAuth, targetAuth),
-						SourceAuth: sourceAuth, Credentials: sourceAuth, TLS: true, TLSMismatch: true, TargetAuth: targetAuth}
-					require.Equal(t, api.LegacyRFDiscoveryPhaseBlocked,
-						runLegacyRFMatrixRow(t, ctx, namespace, f, scenario, source, row, evidence))
-				}
-			}
-			deleteLegacyRFSource(t, ctx, namespace, f, source)
-		}
-	}
-}
-
-func legacyRFSourceID(sourceAuth, tlsEnabled bool) string {
-	authName, tlsName := "anon", "plain"
-	if sourceAuth {
-		authName = "auth"
-	}
-	if tlsEnabled {
-		tlsName = "tls"
-	}
-	return authName + "-" + tlsName
-}
-
-func legacyRFMatrixRowName(sourceID string, credentials, targetAuth bool) string {
-	return fmt.Sprintf("%s-creds-%t-target-auth-%t", sourceID, credentials, targetAuth)
-}
-
-// legacyRFMatrixShortID compresses a matrix coordinate into a few characters. Descriptive row
-// names stay in the evidence, but Kubernetes names derived from them must keep the generated
-// StatefulSet name within the 60 character limit the K8ssandraCluster webhook enforces.
-// "n"/"a" is source authentication off/on, "p"/"t" is plaintext/TLS.
-func legacyRFMatrixShortID(sourceAuth, tlsEnabled bool) string {
-	authPart, tlsPart := "n", "p"
-	if sourceAuth {
-		authPart = "a"
-	}
-	if tlsEnabled {
-		tlsPart = "t"
-	}
-	return authPart + tlsPart
-}
-
-func legacyRFMatrixRowShortID(sourceShortID string, credentials, targetAuth bool) string {
-	return fmt.Sprintf("%s-c%s-t%s", sourceShortID, legacyRFFlag(credentials), legacyRFFlag(targetAuth))
-}
-
-func legacyRFFlag(value bool) string {
-	if value {
-		return "1"
-	}
-	return "0"
-}
-
-func runLegacyRFMatrixRow(
-	t *testing.T,
-	ctx context.Context,
-	namespace string,
-	f *framework.E2eFramework,
-	scenario legacyRFCassandraScenario,
-	source legacyRFSource,
-	row legacyRFMatrixRow,
-	evidence *legacyRFEvidence,
-) api.LegacyRFDiscoveryPhase {
-	cluster := loadLegacyRFTarget(t, namespace, f.DataPlaneContexts[0], scenario, source)
-	configureLegacyRFTargetRow(t, ctx, namespace, f, cluster, source, row)
-	require.NoError(t, f.Client.Create(ctx, cluster))
-	expectedPhase, expectedReason := legacyRFExpectedMatrixOutcome(row)
-	observed := waitForLegacyRFPhase(t, ctx, f.Client, client.ObjectKeyFromObject(cluster), expectedPhase, expectedReason)
-	assertLegacyRFMatrixBoundary(t, ctx, namespace, f, observed, source, row)
-	if expectedPhase == api.LegacyRFDiscoveryPhaseAccepted && row.TargetAuth == row.SourceAuth {
-		_ = waitForLegacyRFTargetReady(t, ctx, namespace, f, observed)
-		output := queryLegacyRFReplication(t, ctx, namespace, f, source, api.SystemAuthKeyspace, row.SourceAuth)
-		// Matrix sources own a single datacenter of their own; legacy-a belongs to the base
-		// lifecycle sources. The external entry must survive the managed datacenter joining.
-		require.Contains(t, output, legacyRFMatrixDatacenter)
-	}
-	evidence.Operations = append(evidence.Operations, legacyRFOperationEvidence{At: time.Now().UTC(),
-		Operation: "credential/TLS matrix", Outcome: fmt.Sprintf("%s:%s", row.Name, expectedPhase)})
-	deleteLegacyRFTarget(t, ctx, f, observed)
-	return expectedPhase
-}
-
-func configureLegacyRFTargetRow(
-	t *testing.T,
-	ctx context.Context,
-	namespace string,
-	f *framework.E2eFramework,
-	cluster *api.K8ssandraCluster,
-	source legacyRFSource,
-	row legacyRFMatrixRow,
-) {
-	cleanName := framework.CleanupForKubernetes("lrf-" + row.ShortID)
-	cluster.Name = cleanName
-	cluster.Spec.Cassandra.Datacenters[0].Meta.Name = framework.CleanupForKubernetes("t-" + row.ShortID)
-	cluster.Spec.Auth = ptr.To(row.TargetAuth)
-	cluster.Spec.Cassandra.LegacyCqlCredentialsSecretRef = nil
-	if row.Credentials {
-		cluster.Spec.Cassandra.LegacyCqlCredentialsSecretRef = &corev1.LocalObjectReference{Name: source.CredentialSecret}
-	}
-	if row.TLS {
-		secretName := source.TLSSecret
-		if row.TLSMismatch {
-			secretName = source.WrongTLSSecret
-		}
-		cluster.Spec.Cassandra.LegacyCqlTLSSecretRef = &corev1.LocalObjectReference{Name: secretName}
-	}
-	if row.TargetAuth {
-		secretName := cleanName + "-target-superuser"
-		secret := &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: secretName, Namespace: namespace},
-			StringData: map[string]string{"username": "managed-admin", "password": "managed-target-e2e-only"}}
-		require.NoError(t, f.Create(ctx, framework.NewClusterKey(f.DataPlaneContexts[0], namespace, secretName), secret))
-		cluster.Spec.Cassandra.SuperuserSecretRef = corev1.LocalObjectReference{Name: secretName}
-	}
-}
-
-func legacyRFExpectedMatrixOutcome(row legacyRFMatrixRow) (api.LegacyRFDiscoveryPhase, api.LegacyRFDiscoveryReason) {
-	if row.TLSMismatch {
-		return api.LegacyRFDiscoveryPhaseBlocked, api.LegacyRFReasonTLSFailed
-	}
-	if row.SourceAuth && !row.Credentials {
-		return api.LegacyRFDiscoveryPhaseBlocked, api.LegacyRFReasonAuthenticationRejected
-	}
-	return api.LegacyRFDiscoveryPhaseAccepted, ""
-}
-
-func waitForLegacyRFPhase(
-	t *testing.T,
-	ctx context.Context,
-	reader client.Reader,
-	key client.ObjectKey,
-	phase api.LegacyRFDiscoveryPhase,
-	reason api.LegacyRFDiscoveryReason,
-) *api.K8ssandraCluster {
-	observed := &api.K8ssandraCluster{}
-	require.NoError(t, wait.PollUntilContextTimeout(ctx, 5*time.Second, 10*time.Minute, true,
-		func(ctx context.Context) (bool, error) {
-			if err := reader.Get(ctx, key, observed); err != nil {
-				return false, client.IgnoreNotFound(err)
-			}
-			status := observed.Status.LegacyRFDiscovery
-			return status != nil && status.Phase == phase && status.Reason == reason, nil
-		}))
-	return observed.DeepCopy()
-}
-
-func assertLegacyRFMatrixBoundary(
-	t *testing.T,
-	ctx context.Context,
-	namespace string,
-	f *framework.E2eFramework,
-	cluster *api.K8ssandraCluster,
-	source legacyRFSource,
-	row legacyRFMatrixRow,
-) {
-	status := cluster.Status.LegacyRFDiscovery
-	dcName := cluster.Spec.Cassandra.Datacenters[0].Meta.Name
-	dc := &cassdcapi.CassandraDatacenter{}
-	dcKey := framework.NewClusterKey(f.DataPlaneContexts[0], namespace, dcName)
-	if status.Phase == api.LegacyRFDiscoveryPhaseBlocked {
-		require.Nil(t, status.AcceptedSnapshot)
-		require.True(t, errors.IsNotFound(f.Get(ctx, dcKey, dc)), "blocked row created managed DC")
-		return
-	}
-	require.NotNil(t, status.AcceptedSnapshot)
-	purposes := make(map[string]struct{}, len(status.AcceptedSnapshot.SecretBindings))
-	for _, binding := range status.AcceptedSnapshot.SecretBindings {
-		purposes[binding.Purpose] = struct{}{}
-	}
-	_, hasAuth := purposes["auth"]
-	_, hasTLS := purposes["tls"]
-	require.Equal(t, row.Credentials, hasAuth)
-	require.Equal(t, row.TLS, hasTLS)
-	require.NotEqual(t, source.CredentialSecret, cluster.Spec.Cassandra.SuperuserSecretRef.Name,
-		"managed target credentials must not supply legacy source authentication")
-}
-
-func deleteLegacyRFTarget(t *testing.T, ctx context.Context, f *framework.E2eFramework, cluster *api.K8ssandraCluster) {
-	key := client.ObjectKeyFromObject(cluster)
-	err := f.DeleteK8ssandraCluster(ctx, key, 15*time.Minute, 5*time.Second)
-	require.NoError(t, err)
-}
-
-func deleteLegacyRFSource(
-	t *testing.T,
-	ctx context.Context,
-	namespace string,
-	f *framework.E2eFramework,
-	source legacyRFSource,
-) {
-	if source.RawStatefulSet != "" {
-		deleteLegacyRFMatrixSource(t, ctx, namespace, f, source)
-		return
-	}
-	suffix := strings.TrimPrefix(source.ClusterName, "legacy-rf-source-")
-	for index := 4; index >= 0; index-- {
-		name := fmt.Sprintf("source-%s-%d", suffix, index)
-		key := framework.NewClusterKey(f.DataPlaneContexts[0], namespace, name)
-		dc := &cassdcapi.CassandraDatacenter{}
-		if err := f.Get(ctx, key, dc); err == nil {
-			require.NoError(t, f.Delete(ctx, key, dc))
-		}
-		require.NoError(t, wait.PollUntilContextTimeout(ctx, 5*time.Second, 10*time.Minute, true,
-			func(ctx context.Context) (bool, error) {
-				err := f.Get(ctx, key, &cassdcapi.CassandraDatacenter{})
-				return errors.IsNotFound(err), client.IgnoreNotFound(err)
-			}))
-	}
-}
-
-func deleteLegacyRFMatrixSource(
-	t *testing.T,
-	ctx context.Context,
-	namespace string,
-	f *framework.E2eFramework,
-	source legacyRFSource,
-) {
-	statefulSet := &appsv1.StatefulSet{}
-	statefulSetKey := framework.NewClusterKey(f.DataPlaneContexts[0], namespace, source.RawStatefulSet)
-	if err := f.Get(ctx, statefulSetKey, statefulSet); err == nil {
-		require.NoError(t, f.Delete(ctx, statefulSetKey, statefulSet))
-	}
-	require.NoError(t, wait.PollUntilContextTimeout(ctx, 2*time.Second, 5*time.Minute, true,
-		func(ctx context.Context) (bool, error) {
-			err := f.Get(ctx, framework.NewClusterKey(f.DataPlaneContexts[0], namespace, source.PodName), &corev1.Pod{})
-			return errors.IsNotFound(err), client.IgnoreNotFound(err)
-		}))
-	service := &corev1.Service{}
-	serviceKey := framework.NewClusterKey(f.DataPlaneContexts[0], namespace, source.ServiceName)
-	if err := f.Get(ctx, serviceKey, service); err == nil {
-		require.NoError(t, f.Delete(ctx, serviceKey, service))
-	}
 }
 
 func runLegacyRFPostReadySchema(
@@ -1567,7 +934,7 @@ func TestLegacyRFSourceTopologyUsesTwoSingleNodeDatacentersAndSparseReplication(
 	for index, dcName := range legacyRFSourceDatacenters {
 		dc := newLegacyRFSourceDatacenter("test", dcName, "4.1.9", legacyRFSource{
 			ClusterName: "legacy", CredentialSecret: "legacy-superuser", ServiceIP: "192.0.2.10",
-		}, true, false, index > 0)
+		}, true, index > 0)
 		require.Equal(t, int32(1), dc.Spec.Size, "source DC %s must remain a single-node metadata fixture", dcName)
 	}
 }
@@ -1578,66 +945,6 @@ func TestDisableLegacyRFHostNetworkInitializesNilClusterNetworking(t *testing.T)
 	require.NotNil(t, cluster.Spec.Cassandra.Networking)
 	require.NotNil(t, cluster.Spec.Cassandra.Networking.HostNetwork)
 	require.False(t, *cluster.Spec.Cassandra.Networking.HostNetwork)
-}
-
-func TestLegacyRFCredentialTLSMatrixDefinition(t *testing.T) {
-	rows := make([]legacyRFMatrixRow, 0, 20)
-	for _, sourceAuth := range []bool{false, true} {
-		for _, tlsEnabled := range []bool{false, true} {
-			for _, credentials := range []bool{false, true} {
-				for _, targetAuth := range []bool{false, true} {
-					rows = append(rows, legacyRFMatrixRow{SourceAuth: sourceAuth, TLS: tlsEnabled,
-						Credentials: credentials, TargetAuth: targetAuth})
-				}
-			}
-			if tlsEnabled {
-				for _, targetAuth := range []bool{false, true} {
-					rows = append(rows, legacyRFMatrixRow{SourceAuth: sourceAuth, TLS: true,
-						Credentials: sourceAuth, TLSMismatch: true, TargetAuth: targetAuth})
-				}
-			}
-		}
-	}
-	require.Len(t, rows, 20)
-	paired := make(map[string]map[bool]api.LegacyRFDiscoveryPhase)
-	for _, row := range rows {
-		phase, reason := legacyRFExpectedMatrixOutcome(row)
-		if row.TLSMismatch {
-			require.Equal(t, api.LegacyRFReasonTLSFailed, reason)
-		} else if row.SourceAuth && !row.Credentials {
-			require.Equal(t, api.LegacyRFReasonAuthenticationRejected, reason)
-		} else {
-			require.Equal(t, api.LegacyRFDiscoveryPhaseAccepted, phase)
-		}
-		key := fmt.Sprintf("%t/%t/%t/%t", row.SourceAuth, row.Credentials, row.TLS, row.TLSMismatch)
-		if paired[key] == nil {
-			paired[key] = make(map[bool]api.LegacyRFDiscoveryPhase)
-		}
-		paired[key][row.TargetAuth] = phase
-	}
-	for key, outcomes := range paired {
-		require.Equal(t, outcomes[false], outcomes[true], "target auth changed outcome for %s", key)
-	}
-}
-
-func TestLegacyRFCredentialTLSMatrixUsesRawPinnedSource(t *testing.T) {
-	source := legacyRFSource{Auth: true, ClusterName: "matrix-auth-tls", RawStatefulSet: "matrix-auth-tls",
-		ServiceName: "matrix-auth-tls", TLSSecret: "matrix-auth-tls-ca"}
-	statefulSet := newLegacyRFMatrixStatefulSet("test", "4.1.9", source, true)
-
-	require.Empty(t, statefulSet.OwnerReferences, "matrix source must not be owned by CassandraDatacenter")
-	require.Equal(t, "docker.io/k8ssandra/cass-management-api:4.1.9-ubi",
-		statefulSet.Spec.Template.Spec.Containers[0].Image)
-	require.Equal(t, map[string]string{"legacy-rf-source": source.RawStatefulSet},
-		statefulSet.Spec.Selector.MatchLabels)
-	require.Contains(t, statefulSet.Spec.Template.Spec.Volumes, corev1.Volume{Name: "client-tls",
-		VolumeSource: corev1.VolumeSource{Secret: &corev1.SecretVolumeSource{SecretName: source.TLSSecret + "-server"}}})
-
-	var config map[string]map[string]any
-	require.NoError(t, json.Unmarshal([]byte(statefulSet.Spec.Template.Spec.InitContainers[0].Env[7].Value), &config))
-	require.Equal(t, "PasswordAuthenticator", config["cassandra-yaml"]["authenticator"])
-	require.Equal(t, legacyRFMatrixSeedServiceName(source.ServiceName), config["cluster-info"]["seeds"],
-		"a standalone source must seed from the Pod address, not the CQL ClusterIP")
 }
 
 func TestLegacyRFEvidenceRejectsMissingRequiredFields(t *testing.T) {
