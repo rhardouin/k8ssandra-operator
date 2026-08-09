@@ -323,6 +323,10 @@ func testSameUIDRecovery(
 	acceptResult := integration.ReconcileGate(ctx, cluster, logr.Discard())
 	acceptErr := acceptResult.GetError()
 	require.NoError(t, acceptErr, "private cause: %v", errors.Unwrap(acceptErr))
+	// Acceptance writes status only, and the primary watch filters status-only updates. Without
+	// an explicit requeue the accepted snapshot would wait for the Job TTL to fire an event
+	// before attempt cleanup and managed datacenter creation could run.
+	require.True(t, acceptResult.IsRequeue(), "acceptance must re-enqueue the cluster itself")
 	require.NotEqual(t, api.LegacyRFDiscoveryPhaseBlocked, cluster.Status.LegacyRFDiscovery.Phase,
 		"reason=%s message=%s", cluster.Status.LegacyRFDiscovery.Reason, cluster.Status.LegacyRFDiscovery.Message)
 	accepted := getCluster(t, ctx, harness.control, client.ObjectKeyFromObject(cluster))

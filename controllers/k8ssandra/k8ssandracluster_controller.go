@@ -75,6 +75,10 @@ type legacyRFControllerRuntime struct {
 const (
 	legacyRFCQLCredentialsSecretRefIndex = ".spec.cassandra.legacyCqlCredentialsSecretRef.name"
 	legacyRFCQLTLSSecretRefIndex         = ".spec.cassandra.legacyCqlTLSSecretRef.name"
+
+	// legacyRFAcceptedRequeueDelay re-enqueues the cluster right after the acceptance write so
+	// the accepted snapshot is read back promptly instead of waiting for an unrelated event.
+	legacyRFAcceptedRequeueDelay = time.Second
 )
 
 // NewLegacyRFControllerIntegration validates and constructs all discovery boundaries.
@@ -534,7 +538,11 @@ func (runtime *legacyRFControllerRuntime) ReconcileGate(ctx context.Context, clu
 	if err != nil {
 		return runtime.stopAttempt(cluster, decision, err)
 	}
-	return result.Done()
+	// Acceptance only writes status, and the primary watch admits generation or annotation
+	// changes, so nothing re-enqueues this cluster on its own. Without an explicit requeue the
+	// accepted snapshot would sit unread until the Job's TTL deletion happens to fire an event,
+	// delaying attempt cleanup and managed-datacenter creation by the whole TTL window.
+	return result.RequeueSoon(legacyRFAcceptedRequeueDelay)
 }
 
 func (runtime *legacyRFControllerRuntime) reconcileAccepted(
