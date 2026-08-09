@@ -149,7 +149,7 @@ spec:
 
 `metadata.name` needs to match the existing Cassandra cluster name so that the datacenters can connect together.
 
-The `additionalSeeds` section requires the IPs of a couple Cassandra nodes (or pods) from the existing datacenter. Those IPs must be reachable on port 7001, which is Cassandra’s storage port used by nodes to communicate with each other.
+The `additionalSeeds` section requires the IPs of a couple Cassandra nodes (or pods) from the existing datacenter. Those IPs must be reachable on port 7001, which is Cassandra’s storage port used by nodes to communicate with each other. A discovery-aware migration additionally reads the source over CQL, so the same IPs must be reachable on port 9042 from the operator namespace.
 
 K8ssandra-operator automatically manages the replication strategy for several keyspaces, such as `system_auth`, `data_endpoint_auth` or `reaper_db`, based on the list of datacenters in a k8c object. It allows safe automation for operations such as expansions to new datacenters. A migration involves one or more datacenters which are not referenced in the k8c object, requiring the addition of extra datacenters in the replication settings. This is what the `externalDatacenters` entry stands for, allowing us to keep replicas on the datacenters we are migrating from.
 
@@ -179,7 +179,7 @@ Datacenter: dc1
 ===============
 Status=Up/Down
 |/ State=Normal/Leaving/Joining/Moving
---  Address     Load      Tokens  Owns (effective)  Host ID                               Rack
+--  Address     Load      Tokens  Owns (effective)  Host ID                               Rack   
 UN  10.xx.xx.57  7.58 MiB  16      100.0%            9299e226-d2fa-4c2e-9fba-3b344d5d47b7  default
 UN  10.xx.xx.7   7.54 MiB  16      100.0%            51c2fb0e-7fad-4b6e-8e4d-2108dc204cd5  default
 UN  10.xx.xx.4   7.89 MiB  16      100.0%            6a92531f-a086-4c40-9067-50899b8974a0  default
@@ -188,7 +188,7 @@ Datacenter: dc2
 ===============
 Status=Up/Down
 |/ State=Normal/Leaving/Joining/Moving
---  Address     Load      Tokens  Owns (effective)  Host ID                               Rack
+--  Address     Load      Tokens  Owns (effective)  Host ID                               Rack   
 UN  10.xx.xx.36  6.97 MiB  16      100.0%            eba0964a-835f-4c76-978e-f25eda0b49ad  default
 UN  10.xx.xx.20  6.81 MiB  16      100.0%            d15f93f4-248d-478f-8832-b87b4e3981d2  default
 UN  10.xx.xx.80  6.71 MiB  16      100.0%            db09fd06-e011-11ec-9d64-0242ac120002  default
@@ -263,7 +263,7 @@ Datacenter: dc2
 ===============
 Status=Up/Down
 |/ State=Normal/Leaving/Joining/Moving
---  Address     Load      Tokens  Owns (effective)  Host ID                               Rack
+--  Address     Load      Tokens  Owns (effective)  Host ID                               Rack   
 UN  10.xx.xx.36  6.97 MiB  16      100.0%            eba0964a-835f-4c76-978e-f25eda0b49ad  default
 UN  10.xx.xx.20  6.81 MiB  16      100.0%            d15f93f4-248d-478f-8832-b87b4e3981d2  default
 UN  10.xx.xx.80  6.71 MiB  16      100.0%            6bca9cdf-03f8-4658-84b9-28c5395235ba  default
@@ -275,4 +275,4 @@ Connect to Reaper’s UI in `dc2`, and re-register the cluster, specifying only 
 ## Next steps
 
 * Explore other K8ssandra Operator [tasks]({{< relref "/tasks" >}}).
-* See the [Reference]({{< relref "/reference" >}}) topics for information about K8ssandra Operator Custom Resource Definitions (CRDs) and the single K8ssandra Operator Helm chart.
+* See the [Reference]({{< relref "/reference" >}}) topics for information about K8ssandra Operator Custom Resource Definitions (CRDs) and the single K8ssandra Operator Helm chart. 

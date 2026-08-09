@@ -170,7 +170,7 @@ func legacyRFPrerequisiteFailure(reason LegacyRFDiscoveryReason) (bool, string, 
 	case LegacyRFReasonJobSchedulingFailed:
 		return true, "The discovery Job could not be scheduled; inspect data-plane capacity and policy.", true
 	case LegacyRFReasonWorkerImageUnavailable, LegacyRFReasonWorkerImagePullFailed:
-		return true, "The digest-pinned discovery worker image is unavailable; restore image access.", true
+		return true, "The discovery worker image is unavailable; restore image access.", true
 	case LegacyRFReasonDiscoveryDeadlineExceeded:
 		return true, "Discovery exceeded its bounded deadline; restore prerequisites and retry.", true
 	default:

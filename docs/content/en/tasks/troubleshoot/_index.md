@@ -59,7 +59,7 @@ kubectl get k8c <cluster_name> -n <namespace> \
   -o jsonpath='{range .status.conditions[?(@.type=="SystemKeyspaceReplicationReady")]}{.status}{"\t"}{.reason}{"\t"}{.message}{"\n"}{end}'
 ```
 
-If CREATE fails during an operator upgrade, confirm that the packaged Deployment is using `Recreate` and that the old manager Pod has terminated before the new webhook admits discovery-marked objects. Do not bypass a failing webhook or manually run old and new reconcilers together; mixed-version operation is unsupported.
+If CREATE fails during an operator upgrade, wait for the rollout to finish so that a single manager Pod is serving admission before submitting discovery-marked objects again. Leader election keeps one reconciler active even while two Pods overlap during a rolling update. Do not bypass a failing webhook or manually run old and new reconcilers together; mixed-version operation is unsupported.
 
 ### Stable reasons and recovery
 
@@ -75,7 +75,7 @@ The Retry column matches the controller's public failure contract. â€œAutomaticâ
 | `DiscoveryTooLate` | `Blocked` | No | Managed Cassandra state already exists. Stop and use a reviewed rollback/recreation procedure; discovery cannot be started retroactively. |
 | `InvalidContactPoint` | `Blocked` or CREATE rejection | No | Use IP literals only, without ports, zones, or surrounding whitespace. |
 | `JobSchedulingFailed` | `Blocked` | Automatic | Inspect data-plane scheduling Events, quota, admission policy, node selectors, and service-account availability. |
-| `WorkerImageUnavailable` | `Blocked` | Automatic | Restore the configured digest-pinned discovery worker image reference. |
+| `WorkerImageUnavailable` | `Blocked` | Automatic | Restore the configured discovery worker image reference. |
 | `WorkerImagePullFailed` | `Blocked` | Automatic | Restore registry reachability and image-pull authorization in the discovery data plane. |
 | `DiscoveryDeadlineExceeded` | `Blocked` | Automatic | Restore network/source responsiveness; the Job has a bounded deadline and no Job-level retry. |
 | `CredentialSecretInvalid` | `Blocked` | Automatic | In the `K8ssandraCluster` namespace, restore the referenced Secret with non-empty `username` and `password` keys. |
