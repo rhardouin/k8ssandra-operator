@@ -359,6 +359,9 @@ type CassandraClusterTemplate struct {
 	// already manages seeds for DCs that it manages. If you have DNS set up such that you
 	// can resolve hostnames for the remote Cassandra cluster, then you can specify hostnames
 	// here; otherwise, use IP addresses.
+	// Note that legacy replication discovery contacts these seeds directly and identifies them
+	// by address, so on clusters created by an operator that supports discovery the entries must
+	// be IP literals without a port. Clusters created before that keep accepting hostnames.
 	AdditionalSeeds []string `json:"additionalSeeds,omitempty"`
 
 	// LegacyCqlCredentialsSecretRef references credentials used only to discover a legacy

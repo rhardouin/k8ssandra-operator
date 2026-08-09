@@ -209,7 +209,12 @@ func TestK8ssandraClusterWebhook(t *testing.T) {
 }
 
 func TestValidateLegacyRFDiscoveryEnforcesSeedLimit(t *testing.T) {
-	cluster := &K8ssandraCluster{Spec: K8ssandraClusterSpec{Cassandra: &CassandraClusterTemplate{}}}
+	cluster := &K8ssandraCluster{
+		ObjectMeta: metav1.ObjectMeta{
+			Annotations: map[string]string{LegacyRFDiscoveryMarkerAnnotation: LegacyRFDiscoveryMarkerVersion},
+		},
+		Spec: K8ssandraClusterSpec{Cassandra: &CassandraClusterTemplate{}},
+	}
 	seeds := make([]string, 33)
 	for index := range seeds {
 		seeds[index] = fmt.Sprintf("192.0.2.%d", index+1)
@@ -220,6 +225,21 @@ func TestValidateLegacyRFDiscoveryEnforcesSeedLimit(t *testing.T) {
 
 	cluster.Spec.Cassandra.AdditionalSeeds = seeds
 	require.ErrorContains(t, validateLegacyRFDiscovery(cluster), "at most 32")
+}
+
+// Clusters created before this feature carry no discovery marker. additionalSeeds has always
+// documented hostnames as supported, so the discovery seed contract must not retroactively make
+// those objects unpatchable.
+func TestValidateLegacyRFDiscoverySparesUnmarkedClusters(t *testing.T) {
+	cluster := &K8ssandraCluster{Spec: K8ssandraClusterSpec{Cassandra: &CassandraClusterTemplate{
+		AdditionalSeeds: []string{"seed-1.legacy.example.test", "seed-2.legacy.example.test"},
+	}}}
+	cluster.Spec.SecretsProvider = "external"
+
+	require.NoError(t, validateLegacyRFDiscovery(cluster))
+
+	metav1.SetMetaDataAnnotation(&cluster.ObjectMeta, LegacyRFDiscoveryMarkerAnnotation, LegacyRFDiscoveryMarkerVersion)
+	require.Error(t, validateLegacyRFDiscovery(cluster))
 }
 
 func removeGeneratedMutatingWebhook(kubeClient client.Client) error {

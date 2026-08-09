@@ -94,7 +94,9 @@ func (r *K8ssandraClusterCustomDefaulter) Default(ctx context.Context, obj *K8ss
 	return nil
 }
 
-//+kubebuilder:webhook:path=/mutate-k8ssandra-io-v1alpha1-k8ssandracluster,mutating=true,failurePolicy=fail,sideEffects=None,groups=k8ssandra.io,resources=k8ssandraclusters,verbs=create;update,versions=v1alpha1,name=mk8ssandracluster.kb.io,admissionReviewVersions=v1
+// The defaulter only stamps the discovery marker on create, and the marker is immutable
+// afterwards, so the mutating webhook has nothing to do on update.
+//+kubebuilder:webhook:path=/mutate-k8ssandra-io-v1alpha1-k8ssandracluster,mutating=true,failurePolicy=fail,sideEffects=None,groups=k8ssandra.io,resources=k8ssandraclusters,verbs=create,versions=v1alpha1,name=mk8ssandracluster.kb.io,admissionReviewVersions=v1
 
 //+kubebuilder:webhook:path=/validate-k8ssandra-io-v1alpha1-k8ssandracluster,mutating=false,failurePolicy=fail,sideEffects=None,groups=k8ssandra.io,resources=k8ssandraclusters,verbs=create;update,versions=v1alpha1,name=vk8ssandracluster.kb.io,admissionReviewVersions=v1
 
@@ -286,7 +288,11 @@ func validateLegacyRFDiscovery(cluster *K8ssandraCluster) error {
 	); err != nil {
 		return err
 	}
-	if len(cluster.Spec.Cassandra.AdditionalSeeds) == 0 {
+	// Only objects carrying the discovery marker are bound by the discovery seed contract. The
+	// marker is stamped by the defaulter on create, so every new object gets it, while clusters
+	// that predate the feature keep the hostname support additionalSeeds has always documented.
+	// Rejecting their seeds on update would make existing clusters unpatchable.
+	if !marked || len(cluster.Spec.Cassandra.AdditionalSeeds) == 0 {
 		return nil
 	}
 	if len(cluster.Spec.Cassandra.AdditionalSeeds) > LegacyRFDiscoveryMaxSeeds {

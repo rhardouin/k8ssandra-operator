@@ -27,7 +27,6 @@ webhooks:
     - v1alpha1
     operations:
     - CREATE
-    - UPDATE
     resources:
     - k8ssandraclusters
   sideEffects: None
